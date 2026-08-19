@@ -67,9 +67,26 @@ def _install_telethon() -> None:
     telethon = types.ModuleType("telethon")
 
     class TelegramClient:
+        """Stub client that records handler registration instead of connecting.
+
+        `on` has to behave like the real decorator (return the function
+        unchanged) so importing a bot module registers its handlers without a
+        network client — that is what makes the panel logic testable at all.
+        """
+
         def __init__(self, *args, **kwargs):
             self.args = args
             self.kwargs = kwargs
+            self.handlers = []
+
+        def on(self, event_spec):
+            def decorator(fn):
+                self.handlers.append((event_spec, fn))
+                return fn
+            return decorator
+
+        async def start(self, *args, **kwargs):
+            return self
 
         async def connect(self):
             return None
@@ -79,6 +96,15 @@ def _install_telethon() -> None:
 
         async def is_user_authorized(self):
             return True
+
+        async def send_message(self, *args, **kwargs):
+            return None
+
+        async def send_file(self, *args, **kwargs):
+            return None
+
+        async def run_until_disconnected(self):
+            return None
 
     class _Button:
         @staticmethod
@@ -91,12 +117,25 @@ def _install_telethon() -> None:
 
     events = types.ModuleType("telethon.events")
 
-    class _Event:
-        class Event:
+    class _EventSpec:
+        """Accepts the same kwargs as the real event builders and remembers them,
+        so a test can assert which callback data a handler was bound to."""
+
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        class Event:                     # for isinstance() checks in handlers
             pass
 
-    events.NewMessage = _Event
-    events.CallbackQuery = _Event
+    class NewMessage(_EventSpec):
+        pass
+
+    class CallbackQuery(_EventSpec):
+        pass
+
+    events.NewMessage = NewMessage
+    events.CallbackQuery = CallbackQuery
 
     errors = types.ModuleType("telethon.errors")
 
@@ -144,6 +183,58 @@ def _install_telethon() -> None:
     sys.modules["telethon.tl.functions.contacts"] = contacts
 
 
+def _install_httpx() -> None:
+    """Stub httpx whose behaviour a test can steer.
+
+    Set `httpx.NEXT_ERROR` to raise on the next request, or `httpx.NEXT_JSON` to
+    control the payload. This lets the master->worker call path (tunnel reuse,
+    tunnel teardown on failure) be tested without a network.
+    """
+    if "httpx" in sys.modules:
+        return
+
+    httpx = types.ModuleType("httpx")
+    httpx.NEXT_ERROR = None
+    httpx.NEXT_JSON = {"ok": True}
+    httpx.CALLS = []
+
+    class _Response:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class AsyncClient:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            httpx.CALLS.append((method, url, kwargs))
+            if httpx.NEXT_ERROR is not None:
+                error, httpx.NEXT_ERROR = httpx.NEXT_ERROR, None
+                raise error
+            return _Response(httpx.NEXT_JSON)
+
+        async def get(self, url, **kwargs):
+            return await self.request("GET", url, **kwargs)
+
+    httpx.AsyncClient = AsyncClient
+    httpx.Response = _Response
+    sys.modules["httpx"] = httpx
+
+
 def install() -> None:
     _install_rubpy()
     _install_telethon()
+    _install_httpx()

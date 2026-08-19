@@ -193,10 +193,15 @@ def test_owner_only_readers_are_named_with_the_owner_prefix():
 # --------------------------------------------------------------------------- #
 # The log group must never be mentioned to a customer
 # --------------------------------------------------------------------------- #
-def test_no_customer_facing_text_mentions_the_log_group():
+def test_only_logbus_knows_the_log_group_id():
     """A customer must never learn the log group exists — not its id, not even
-    the phrase. Only logbus may reference LOG_GROUP_ID at all."""
-    allowed_files = {"logbus.py", "config.py", "backup.py", "owner_bot.py"}
+    the phrase.
+
+    Keeping the id in exactly two places (the setting, and the one module that
+    delivers) means no future screen can accidentally print it, and every log
+    line goes through the same redaction path.
+    """
+    allowed_files = {"logbus.py", "config.py"}
     for name in os.listdir(ROOT):
         if not name.endswith(".py") or name in allowed_files:
             continue
