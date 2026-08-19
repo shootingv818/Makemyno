@@ -86,7 +86,8 @@ say "محیط مجازی و کتابخانه‌ها"
 # --------------------------------------------------------------------------- #
 [ -d .venv ] || python3 -m venv .venv
 ./.venv/bin/pip install --quiet --upgrade pip wheel setuptools
-./.venv/bin/pip install --quiet -r requirements.txt
+./.venv/bin/pip install --quiet --prefer-binary --retries 10 --timeout 180 \
+    -r requirements.txt
 ok "$(./.venv/bin/pip list 2>/dev/null | wc -l) بسته نصب است"
 
 # Prove the imports actually resolve before we hand the machine to systemd.

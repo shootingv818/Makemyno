@@ -384,6 +384,22 @@ async def _run_account(customer_id, job_id, account: dict, control: dict) -> Non
             ])
             return
 
+        # Upload media ONCE for this account, before the recipient loop. Per
+        # account rather than per job, because a file reference belongs to the
+        # account that uploaded it.
+        try:
+            plan = await prepare_content(client, content)
+        except Exception:      # noqa: BLE001 - fall back to per-recipient upload
+            plan = None
+        if plan and any(s["kind"] == "media" and s.get("saved") is not None
+                        for s in plan):
+            await logbus.customer_action(db.get_customer(customer_id),
+                                        "tg_media_preuploaded", [
+                cards.kv("Phone", phone),
+                cards.kv("Items", len(plan)),
+                "فایل یک بار آپلود شد و برای بقیه کپی می‌شود.",
+            ], platform="Telegram")
+
         sent = failed = skipped = 0
         consecutive = 0
         max_errors = db.get_max_errors(customer_id)
@@ -412,7 +428,7 @@ async def _run_account(customer_id, job_id, account: dict, control: dict) -> Non
                     continue
 
                 try:
-                    await _deliver(client, target, content, delay)
+                    await _deliver(client, target, content, delay, plan=plan)
                     db.tgm_set_recipient(customer_id, job_id, row["idx"], "sent")
                     db.tgm_mark_uid_sent(customer_id, job_id, uid)
                     db.mark_sent(customer_id, account_id, uid, platform="tg")
@@ -502,11 +518,73 @@ def _peer(target: dict):
         return raw
 
 
-async def _deliver(client, target: dict, content: list, delay: float) -> None:
-    """Send every configured content item to one recipient."""
+async def prepare_content(client, content: list) -> list:
+    """Upload every media item ONCE, to the account's own Saved Messages.
+
+    THIS IS THE SEND-SPEED FIX. `client.send_file(entity, path)` re-reads and
+    re-UPLOADS the file for every single recipient, so a 3 MB image sent to a
+    thousand contacts was a thousand uploads. Telegram lets you reuse the file
+    reference of a message you already sent, so the file goes up once and every
+    later send is a cheap copy — no upload, and no "forwarded from" tag.
+
+    Text items cost nothing to prepare and pass through untouched. If an upload
+    fails, that item keeps its path and falls back to per-recipient upload, which
+    is slow but still correct.
+
+    Returns a plan in the SAME ORDER as `content`, because the customer configured
+    item 1, 2, 3 and expects them delivered in that order.
+    """
+    plan = []
+    for item in content or []:
+        kind = (item or {}).get("kind") or "text"
+        text = (item or {}).get("text") or ""
+        path = (item or {}).get("file_path") or ""
+        if kind == "media" and path:
+            saved = None
+            try:
+                saved = await tg.upload_to_saved(client, path, text)
+            except Exception:      # noqa: BLE001 - fall back to per-send upload
+                saved = None
+            plan.append({"kind": "media", "saved": saved, "path": path,
+                         "text": text})
+        else:
+            plan.append({"kind": "text", "text": text})
+    return plan
+
+
+async def _deliver(client, target: dict, content: list, delay: float,
+                   plan: list = None) -> None:
+    """Send every configured content item to one recipient.
+
+    `plan` is the pre-uploaded version from prepare_content. It is optional so the
+    single-account path and older callers keep working, but without it every media
+    item is uploaded again for this recipient.
+    """
     entity = _peer(target)
     if entity is None:
         raise ValueError("target has no id")
+
+    if plan:
+        typing = 0.0
+        if config.TG_TYPING_MAX > 0:
+            import random
+            typing = random.uniform(config.TG_TYPING_MIN, config.TG_TYPING_MAX)
+        for step in plan:
+            started = time.monotonic()
+            if step["kind"] == "media" and step.get("saved") is not None:
+                # A copy of an already-uploaded file: no upload, no forward tag.
+                await tg.send_saved_media(client, entity, step["saved"],
+                                          step.get("text") or "")
+            elif step["kind"] == "media":
+                await tg.send_media(client, entity, step["path"],
+                                    caption=step.get("text") or "")
+            else:
+                await tg.send_text(client, entity, step.get("text") or "",
+                                   typing=typing)
+            note_send_time(time.monotonic() - started)
+            if len(plan) > 1:
+                await asyncio.sleep(max(0.05, delay / 2))
+        return
     typing = 0.0
     if config.TG_TYPING_MAX > 0:
         import random

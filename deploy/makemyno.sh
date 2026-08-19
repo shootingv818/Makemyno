@@ -77,7 +77,8 @@ update)
     git reset --hard --quiet "origin/$branch"
     ok "$before → $(git rev-parse --short HEAD)"
 
-    ./.venv/bin/pip install --quiet -r requirements.txt
+    ./.venv/bin/pip install --quiet --prefer-binary --retries 10 --timeout 180 \
+        -r requirements.txt
     ok "کتابخانه‌ها بررسی شد"
 
     # Clear cached bytecode. On this fleet a `git reset --hard` did not reliably

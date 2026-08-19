@@ -230,6 +230,13 @@ async def _run_single(customer_id, acc: dict, msg=None) -> None:
             if msg is not None:
                 progress = asyncio.create_task(_progress_loop(aid, ctl, msg))
 
+            # Upload media once, then copy it to everyone. Without this each
+            # recipient triggers a fresh upload of the same file.
+            try:
+                plan = await multi.prepare_content(client, content)
+            except Exception:      # noqa: BLE001
+                plan = None
+
             consecutive = 0
             max_errors = db.get_max_errors(customer_id)
             for entity, _mutual in recipients:
@@ -245,7 +252,7 @@ async def _run_single(customer_id, acc: dict, msg=None) -> None:
                 try:
                     await multi._deliver(client,
                                          {"kind": "user", "id": entity},
-                                         content, delay)
+                                         content, delay, plan=plan)
                     db.mark_sent(customer_id, aid, uid_key, platform="tg")
                     ctl["sent"] += 1
                     consecutive = 0

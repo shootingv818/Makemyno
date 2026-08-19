@@ -240,7 +240,10 @@ def _fake_client_layer(monkeypatch, delivered, fail_on=None, raise_exc=None):
     async def fake_get_client(customer_id, account_id):
         return _Client()
 
-    async def fake_deliver(client, target, content, delay):
+    async def fake_deliver(client, target, content, delay, plan=None):
+        # `plan` is the pre-uploaded media plan. Accepting it here keeps this fake
+        # honest about the real signature: media is uploaded once per account now,
+        # not re-uploaded for every recipient.
         uid = target.get("id")
         if fail_on is not None and uid in fail_on:
             raise (raise_exc or RuntimeError("send failed"))
@@ -309,7 +312,10 @@ def test_a_fatal_account_error_stops_only_that_account(alice, monkeypatch):
     async def fake_get_client(customer_id, account_id):
         return _Client()
 
-    async def fake_deliver(client, target, content, delay):
+    async def fake_deliver(client, target, content, delay, plan=None):
+        # `plan` is the pre-uploaded media plan. Accepting it here keeps this fake
+        # honest about the real signature: media is uploaded once per account now,
+        # not re-uploaded for every recipient.
         uid = target.get("id")
         if uid == 1:
             raise Exception("AUTH_KEY_UNREGISTERED")
@@ -468,7 +474,7 @@ def test_stop_sets_the_flag_and_the_loop_notices(alice, monkeypatch):
     async def fake_get_client(customer_id, account_id):
         return _Client()
 
-    async def slow_deliver(client, target, content, delay):
+    async def slow_deliver(client, target, content, delay, plan=None):
         delivered.append(target.get("id"))
         await asyncio.sleep(0.05)
 

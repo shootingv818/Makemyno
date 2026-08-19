@@ -30,8 +30,15 @@ COPY requirements.txt .
 # Upgrading pip first matters: an old pip may ignore a manylinux wheel and try to
 # build from source, which is exactly when the apt step above becomes load-bearing.
 # The retries and longer timeout are for servers with slow or unreliable networks.
+# --prefer-binary is the important flag. A provisioning attempt was seen COMPILING
+# telethon from its source tarball — thousands of files through bdist_wheel — which
+# on a small VPS is slow enough to look hung and can exhaust memory outright.
+# telethon is pure Python and publishes a ready wheel; pip only fell back to
+# building because an index mirror served the sdist first. --prefer-binary tells it
+# to take the wheel wherever one exists.
 RUN pip install --upgrade pip \
- && pip install --retries 10 --timeout 120 -r requirements.txt
+ && pip install --prefer-binary --retries 10 --timeout 180 \
+      -r requirements.txt
 
 # The .git directory is copied deliberately: a worker has no git binary, and
 # /ping reads the commit straight out of .git so the owner panel can show which
