@@ -140,8 +140,10 @@ def dashboard_card() -> str:
     return cards.panel_card("🎛 - #owner_panel", rows)
 
 
-@bot.on(events.NewMessage(pattern="/start"))
+@bot.on(events.NewMessage(pattern=r"^/start", func=lambda e: e.is_private))
 async def start_handler(event):
+    """`is_private` matters: this bot is a member of the log group, and without
+    it a /start typed there would print the whole dashboard into the group."""
     if not is_owner(event):
         return                       # strangers get absolute silence
     state.pop(event.sender_id, None)

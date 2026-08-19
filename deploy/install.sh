@@ -104,6 +104,14 @@ say "فایل .env"
 # --------------------------------------------------------------------------- #
 if [ -f .env ]; then
     ok ".env از قبل هست، دست نمی‌زنم"
+    # ...with one exception. A MODE line here used to override the per-service
+    # role (systemd lets EnvironmentFile win over Environment), which started the
+    # owner bot twice and the customer bot never. Existing installs carry that
+    # line, so it is removed on upgrade.
+    if grep -q '^MODE=' .env; then
+        sed -i '/^MODE=/d' .env
+        warn "خط MODE از .env حذف شد — باعث می‌شد هر دو سرویس ربات مالک را اجرا کنند"
+    fi
 else
     [ -f deploy/env.template ] || die "deploy/env.template پیدا نشد"
     cp deploy/env.template .env

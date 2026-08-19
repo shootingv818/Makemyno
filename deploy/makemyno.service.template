@@ -19,10 +19,18 @@ StartLimitIntervalSec=120
 Type=simple
 WorkingDirectory={{APP_DIR}}
 EnvironmentFile={{APP_DIR}}/.env
-# Overrides MODE from the .env: one file, two roles.
-Environment=MODE={{ROLE}}
 Environment=PYTHONUNBUFFERED=1
-ExecStart={{APP_DIR}}/.venv/bin/python {{APP_DIR}}/main.py
+
+# The role is an ARGUMENT, not an environment variable.
+#
+# It used to be `Environment=MODE={{ROLE}}`, and that was a production bug:
+# systemd documents EnvironmentFile= as OVERRIDING Environment=, so a stray
+# `MODE=owner` line in the shared .env won and both units started the owner bot.
+# One /start answered with two dashboards, the customer bot answered nothing at
+# all, and the log group looked perfectly healthy.
+#
+# argv cannot be overridden by a file somebody edits later.
+ExecStart={{APP_DIR}}/.venv/bin/python {{APP_DIR}}/main.py {{ROLE}}
 
 # A bot that dies at 3am must come back on its own.
 Restart=always
