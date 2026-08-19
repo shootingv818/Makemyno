@@ -811,9 +811,26 @@ async def _launch(event, st, mode: str, content: str) -> None:
     asyncio.create_task(run_job(uid, job_id, msg))
 
 
+async def _step_mode(event, st):
+    """The mode is chosen with a button, but the customer may well type instead.
+
+    Without this the wizard sits in a step nothing handles and the bot answers
+    nothing at all, which is indistinguishable from being broken. Saying "use the
+    buttons" costs one line and removes a dead end.
+    """
+    await _respond(event, cards.card("✉️ محتوای پیام", [
+        "با دکمه‌ها انتخاب کن: فوروارد پیام مارک‌شده، یا متن.",
+    ]), buttons=[
+        [Button.inline("📎 فوروارد پیام مارک‌شده", b"plmode_marker")],
+        [Button.inline("✍️ متن", b"plmode_text")],
+        _back(b"rbpool"),
+    ])
+
+
 _STEPS = {
     "pl_prefix": _step_prefix,
     "pl_target": _step_target,
+    "pl_mode": _step_mode,
     "pl_text": _step_text,
 }
 
