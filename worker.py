@@ -258,13 +258,21 @@ async def provision_worker(ip: str, ssh_port: int, ssh_user: str, ssh_pass: str,
         await _run(conn, f"cat > {REMOTE_DIR}/.env <<'ENVEOF'\n{env_lines}ENVEOF")
 
         await say("🏗 ساخت ایمیج Docker (چند دقیقه طول می‌کشه) ...")
+        # DOCKER_BUILDKIT=1 uses the builder built into docker since 18.09 (no
+        # separate buildx plugin needed for `docker build`). It silences the
+        # "legacy builder is deprecated" warning that was drowning the REAL error
+        # in the report, and it is the more robust builder anyway.
         # --network=host lets build steps use the server's own DNS, avoiding the
         # common "build container cannot resolve PyPI" failure on fresh servers.
         code, out, err = await _run(
-            conn, f"cd {REMOTE_DIR} && docker build --network=host -t {IMAGE} .")
+            conn, f"cd {REMOTE_DIR} && DOCKER_BUILDKIT=1 "
+            f"docker build --network=host -t {IMAGE} .")
         if code != 0:
-            return {"ok": False,
-                    "error": f"docker build شکست خورد: {(err or out)[-600:]}"}
+            # Show the tail of BOTH streams: the actual failure (a missing apt
+            # package, a DNS error) is usually the last thing printed, and cutting
+            # to 600 chars once hid it behind a deprecation banner.
+            detail = (out + "\n" + err).strip()[-1200:]
+            return {"ok": False, "error": f"docker build شکست خورد:\n{detail}"}
 
         await say("🚀 اجرای کانتینر ...")
         run_cmd = (
@@ -331,7 +339,7 @@ async def update_worker(worker: dict) -> tuple:
             f"git remote set-url origin '{config.GIT_REPO_URL}' && "
             f"git fetch --depth 1 origin {branch} && "
             f"git checkout -B {branch} FETCH_HEAD && "
-            f"docker build --network=host -t {IMAGE} . && "
+            f"DOCKER_BUILDKIT=1 docker build --network=host -t {IMAGE} . && "
             f"(docker rm -f {CONTAINER} 2>/dev/null || true) && "
             f"docker run -d --name {CONTAINER} --restart always --network=host "
             f"--env-file {REMOTE_DIR}/.env -v {REMOTE_DATA}:/app/data {IMAGE}"

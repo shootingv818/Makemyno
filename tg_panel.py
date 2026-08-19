@@ -1006,6 +1006,36 @@ async def _launch_multi(customer_id, account_ids: list, content: list,
     if msg is not None:
         db.tgm_update_job(customer_id, job_id, msg_id=msg.id)
     await multi.start(customer_id, job_id)
+    # Live card. multi.start spawns the job in the background and returns at once,
+    # so without this the card only moved when the customer tapped a button —
+    # which reads as "stuck". Single-send already had a refresher; multi did not.
+    if msg is not None:
+        asyncio.create_task(_multi_progress_loop(customer_id, job_id, msg))
+
+
+async def _multi_progress_loop(customer_id, job_id, msg) -> None:
+    """Refresh the multi-send card until the job reaches a terminal state."""
+    terminal = {"done", "stopped", "failed", "stop_requested"}
+    last = ""
+    while True:
+        await asyncio.sleep(config.TG_STATS_REFRESH)
+        st = multi.status(customer_id, job_id)
+        if not st:
+            return
+        text = multi.progress_card(customer_id, job_id)
+        state = st.get("state")
+        buttons = [[Button.inline("📊 وضعیت", f"tgjob_{job_id}".encode())]]
+        if state in ("running", "queued"):
+            buttons = [[Button.inline("⛔ توقف", f"tgjstop_{job_id}".encode())],
+                       [Button.inline("📊 جزئیات", f"tgjob_{job_id}".encode())]]
+        if text != last:
+            last = text
+            try:
+                await msg.edit(text, buttons=buttons)
+            except Exception:      # noqa: BLE001 - a failed edit must not kill the loop
+                pass
+        if state in terminal:
+            return
 
 
 # --------------------------------------------------------------------------- #

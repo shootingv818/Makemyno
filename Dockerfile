@@ -11,8 +11,11 @@ WORKDIR /app
 
 # Build deps for Pillow/reportlab wheels that may need compiling, plus the
 # minimum runtime libs. Removed again in the same layer to keep the image small.
-RUN apt-get update -qq \
- && apt-get install -y --no-install-recommends \
+# `update || update` is a cheap retry: a fresh server often has one flaky apt
+# mirror on the first hit that succeeds on the second. --fix-missing rides out a
+# single unreachable package rather than failing the whole build.
+RUN (apt-get update -qq || apt-get update -qq) \
+ && apt-get install -y --no-install-recommends --fix-missing \
       gcc libjpeg62-turbo-dev zlib1g-dev libffi-dev \
  && rm -rf /var/lib/apt/lists/*
 

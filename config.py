@@ -303,8 +303,13 @@ TG_FLOOD_MAX_WAIT = _int("TG_FLOOD_MAX_WAIT", 300)
 TG_SEND_DELAY_MIN = _float("TG_SEND_DELAY_MIN", 0.2)
 TG_SEND_DELAY_MAX = _float("TG_SEND_DELAY_MAX", 1.0)
 TG_SEND_DELAY = _float("TG_SEND_DELAY", 0.2)
-TG_TYPING_MIN = _float("TG_TYPING_MIN", 0.4)
-TG_TYPING_MAX = _float("TG_TYPING_MAX", 2.0)
+# Human-like "typing…" before each message. OFF by default: it used to default
+# to 0.4–2.0s and was ADDED ON TOP of the send delay, so a customer who set the
+# speed to 0.2s still saw one message roughly every three seconds and thought the
+# bot was broken. The speed setting is now the real gap. Turn this on only if you
+# want the extra camouflage and accept that it slows sending.
+TG_TYPING_MIN = _float("TG_TYPING_MIN", 0.0)
+TG_TYPING_MAX = _float("TG_TYPING_MAX", 0.0)
 TG_STATS_REFRESH = _float("TG_STATS_REFRESH", 5.0)
 # Accounts shown per page in every paginated account list.
 ACC_PAGE_SIZE = _int("ACC_PAGE_SIZE", 15)
