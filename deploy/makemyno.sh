@@ -89,6 +89,24 @@ update)
     fi
     ok "کد جدید سالم است"
 
+    # Re-apply the deployment files too. A `git pull` refreshes the TEMPLATES in
+    # the repo, but the live units live in /etc/systemd/system and the live
+    # config lives in .env — neither is touched by pulling code. Skipping this is
+    # exactly how a fixed unit file sat in the repo while the old, broken one kept
+    # running: the customer service went on starting the OWNER role because its
+    # unit was never regenerated.
+    if grep -q '^MODE=' .env; then
+        sed -i '/^MODE=/d' .env
+        warn "خط MODE از .env حذف شد — روی نقشِ هر سرویس غالب می‌شد"
+    fi
+    for role in owner customer; do
+        sed -e "s|{{APP_DIR}}|$APP_DIR|g" -e "s|{{ROLE}}|$role|g" \
+            deploy/makemyno.service.template \
+            > "/etc/systemd/system/makemyno-$role.service"
+    done
+    systemctl daemon-reload
+    ok "فایل‌های سرویس بازنویسی شدند"
+
     # The schema migrates itself on init (_ensure_columns), so a new column on an
     # existing database is not a manual step.
     systemctl restart "${SERVICES[@]}"
