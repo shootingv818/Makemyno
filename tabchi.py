@@ -297,12 +297,11 @@ async def _secretary_pass(customer_id, acc: dict) -> dict:
             async def _find(client):
                 return (await rb.get_self_guid(client),
                         await rb.find_marked_message(client, marker))
-            from_guid, found = await account_conn.call(customer_id, phone,
-                                                      _find, timeout=120)
-            if not found:
+            from_guid, message_id = await account_conn.call(customer_id, phone,
+                                                           _find, timeout=120)
+            if not message_id:
                 result["reason"] = "no_marker"
                 return result
-            message_id = rb._msg_id_of(found)      # noqa: SLF001
 
         for guid in guids:
             if db.secretary_was_replied(customer_id, aid, guid):

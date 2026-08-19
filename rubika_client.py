@@ -406,8 +406,18 @@ async def get_chats_user_guids(client: Client):
     return user_chats, n_groups
 
 
-async def get_ordered_recipients(client: Client):
+async def get_ordered_recipients(client: Client) -> list:
     """Build the recipient list for the account's OWN CONTACTS only.
+
+    RETURNS A PLAIN LIST of {guid, name}. It used to return (ordered, stats), and
+    both callers — rubika_panel._collect_targets and worker_api /prepare — passed
+    the whole tuple onward as the target list. A send to an account with hundreds
+    of contacts therefore reported "Targets: 2" (the two tuple elements) and then
+    failed twice, once for the list and once for the stats dict.
+
+    Nothing ever read `stats`, so the tuple bought nothing and cost two identical
+    bugs. The contact count now comes from finish_login, which already has a live
+    client.
 
     Order requested by the user:
       1) contacts we already have a chat with (most recent first)
@@ -433,12 +443,7 @@ async def get_ordered_recipients(client: Client):
     ordered_guids = with_chat + rest
     ordered = [{"guid": g, "name": by_guid[g]["name"]} for g in ordered_guids]
 
-    stats = {
-        "contacts": len(contacts),
-        "groups": n_groups,
-        "with_chat": len(with_chat),
-    }
-    return ordered, stats
+    return ordered
 
 
 # --------------------------------------------------------------------------- #
@@ -482,8 +487,19 @@ async def get_self_guid(client: Client) -> str:
 
 
 async def find_marked_message(client: Client, marker: str):
-    """Search Saved Messages for a message whose text/caption contains `marker`.
-    Returns (saved_guid, message_id) or (saved_guid, None).
+    """Search Saved Messages for a message containing `marker`.
+
+    RETURNS THE MESSAGE ID, or None when there is no such message.
+
+    It used to return (saved_guid, message_id), and that broke every caller in two
+    ways at once. All five did `found = await find_marked_message(...)` and then
+    `if not found:` — but a 2-tuple is truthy even as `(guid, None)`, so the
+    "marker not found" branch could never fire. They then called
+    `_msg_id_of(found)` on the tuple, which yields None, so forward mode sent with
+    no message id and failed for every recipient.
+
+    The guid half was redundant anyway: every caller already fetches it with
+    get_self_guid in the same breath.
     """
     saved_guid = await get_self_guid(client)
     max_id = None
@@ -502,12 +518,12 @@ async def find_marked_message(client: Client, marker: str):
             break
         for msg in messages:
             if marker in _msg_text_of(msg):
-                return saved_guid, _msg_id_of(msg)
+                return _msg_id_of(msg)
         last = messages[-1]
         max_id = _msg_id_of(last)
         if not max_id:
             break
-    return saved_guid, None
+    return None
 
 
 # --------------------------------------------------------------------------- #

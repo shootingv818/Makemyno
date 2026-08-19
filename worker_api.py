@@ -320,17 +320,22 @@ def build_app():
 
             async def _work(client):
                 self_guid = await rb.get_self_guid(client)
-                found = await rb.find_marked_message(client, body.marker)
+                message_id = await rb.find_marked_message(client, body.marker)
                 recipients = await rb.get_ordered_recipients(client)
-                return self_guid, found, recipients
+                return self_guid, message_id, recipients
 
-            self_guid, found, recipients = await account_conn.call(
+            self_guid, message_id, recipients = await account_conn.call(
                 body.customer_id, body.phone, _work, timeout=180)
-            if not found:
+            if not message_id:
                 return {"ok": False, "error": "marker not found"}
+            # Plain guid strings over the wire. get_ordered_recipients yields
+            # {"guid", "name"} dicts, and shipping those made the master str() a
+            # dict into every send target.
+            targets = [str(r.get("guid") if isinstance(r, dict) else r)
+                       for r in (recipients or [])
+                       if (r.get("guid") if isinstance(r, dict) else r)]
             return {"ok": True, "from_guid": self_guid,
-                    "message_id": rb._msg_id_of(found),   # noqa: SLF001
-                    "targets": recipients}
+                    "message_id": message_id, "targets": targets}
         except Exception as exc:
             raise HTTPException(status_code=400,
                                 detail=f"{type(exc).__name__}: {str(exc)[:200]}")
@@ -716,6 +721,8 @@ def build_app():
                             await rb.find_marked_message(client, body.marker))
                 self_guid, marker_msg = await account_conn.call(
                     body.customer_id, body.phone, _find, timeout=120)
+                # A real check now: this received a truthy 2-tuple before, so a
+                # missing marker sailed through and every forward failed instead.
                 if not marker_msg:
                     return {"ok": False, "error": "marker not found"}
 
@@ -725,9 +732,9 @@ def build_app():
                 try:
                     if marker_msg is not None:
                         async def _one(client, g=guid):
+                            # marker_msg IS the id now, not a tuple to dig into.
                             return await rb.forward_message(
-                                client, self_guid, g,
-                                rb._msg_id_of(marker_msg))   # noqa: SLF001
+                                client, self_guid, g, marker_msg)
                     else:
                         async def _one(client, g=guid):
                             return await rb.send_text(client, g, body.text)

@@ -322,17 +322,16 @@ async def _send_account(customer_id, job_id, acc: dict, ctl: dict) -> None:
                 return (await rb.get_self_guid(client),
                         await rb.find_marked_message(client, job["content"]))
             try:
-                from_guid, found = await account_conn.call(
+                from_guid, message_id = await account_conn.call(
                     customer_id, phone, _find, timeout=120)
             except Exception as exc:  # noqa: BLE001
                 db.pool_set_account(customer_id, job_id, aid, status="failed",
                                     note=type(exc).__name__)
                 return
-            if not found:
+            if not message_id:
                 db.pool_set_account(customer_id, job_id, aid, status="failed",
                                     note="marker not found")
                 return
-            message_id = rb._msg_id_of(found)      # noqa: SLF001
 
         for target in targets:
             if ctl.get("stop"):

@@ -335,12 +335,14 @@ async def _run_send_local(customer_id, acc, mode, text, targets, ctl,
         async def _find(client):
             return (await rb.get_self_guid(client),
                     await rb.find_marked_message(client, marker))
-        from_guid, found = await account_conn.call(customer_id, phone, _find,
-                                                  timeout=180)
-        if not found:
+        from_guid, message_id = await account_conn.call(customer_id, phone, _find,
+                                                       timeout=180)
+        # find_marked_message returns the id itself now, so this check actually
+        # works. It used to receive a 2-tuple, which is truthy even when the marker
+        # was missing, and then derived a None id from it.
+        if not message_id:
             ctl["state"] = "no_marker"
             return
-        message_id = rb._msg_id_of(found)      # noqa: SLF001
 
     consecutive = 0
     for target in targets:
@@ -381,7 +383,6 @@ async def _run_send_local(customer_id, acc, mode, text, targets, ctl,
 
 async def _run_send_remote(customer_id, acc, w, mode, text, targets, ctl) -> None:
     """Hand the list to the worker that owns the session and follow its progress."""
-    phone = acc["id"], acc["phone"]
     aid, phone = acc["id"], acc["phone"]
     marker = db.get_marker(customer_id)
     payload = {"customer_id": customer_id, "phone": phone,
@@ -1791,8 +1792,31 @@ async def _prepare_and_send(customer_id, acc: dict, mode: str, text: str,
     await _run_send(customer_id, acc, mode, text, targets, msg)
 
 
+def _guids_only(items) -> list:
+    """Normalise a recipient list to plain guid STRINGS.
+
+    Every consumer wants a string: rb.send_text takes a guid, db.mark_sent stores
+    one, and the worker payload does str(t). But get_ordered_recipients yields
+    {"guid": ..., "name": ...} dicts, so the send loop was handing whole dicts to
+    send_text and str()-ing dicts into the worker payload. Normalising once here
+    means no consumer has to know which shape it received.
+    """
+    out = []
+    for item in items or []:
+        if isinstance(item, dict):
+            guid = item.get("guid") or item.get("object_guid")
+        else:
+            guid = item
+        if guid:
+            out.append(str(guid))
+    return out
+
+
 async def _collect_targets(customer_id, acc: dict) -> list:
-    """The account's own recipients, ordered. Runs under its own session claim."""
+    """The account's own recipients as guid strings, ordered.
+
+    Runs under its own session claim.
+    """
     phone = acc["phone"]
     key = _key(customer_id, phone)
     w = worker.worker_for_account(acc)
@@ -1800,7 +1824,7 @@ async def _collect_targets(customer_id, acc: dict) -> list:
         prep = await worker.api_call(w, "POST", "/prepare", {
             "customer_id": customer_id, "phone": phone,
             "marker": db.get_marker(customer_id)}, timeout=240)
-        return list(prep.get("targets") or [])
+        return _guids_only(prep.get("targets"))
 
     import account_conn
     async with busy.hold(key, "precheck", customer_id=customer_id,
@@ -1811,7 +1835,13 @@ async def _collect_targets(customer_id, acc: dict) -> list:
         async def _work(client):
             return await rb.get_ordered_recipients(client)
 
-        return await account_conn.call(customer_id, phone, _work, timeout=300)
+        got = await account_conn.call(customer_id, phone, _work, timeout=300)
+        # Defensive: a tuple here is the shape that produced "Targets: 2" and two
+        # failed sends on an account with hundreds of contacts. The contract is a
+        # list now, and anything else is coerced rather than silently messaged.
+        if isinstance(got, tuple):
+            got = got[0] if got and isinstance(got[0], list) else []
+        return _guids_only(got)
 
 
 # --------------------------------------------------------------------------- #
