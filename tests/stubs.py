@@ -182,10 +182,22 @@ def _install_telethon() -> None:
     tl.functions = functions
 
     tl_types = types.ModuleType("telethon.tl.types")
-    for name in ("User", "Chat", "Channel", "InputPeerUser", "PeerUser",
+
+    def _keep_kwargs(self, *args, **kwargs):
+        """Remember the constructor arguments.
+
+        The original stub swallowed them, which made it impossible to assert that
+        an InputPeer was built with the right id and access_hash — and building
+        those correctly is what saves an API round-trip per recipient. A stub that
+        silently drops its arguments cannot catch a caller passing the wrong ones.
+        """
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    for name in ("User", "Chat", "Channel", "PeerUser",
+                 "InputPeerUser", "InputPeerChannel", "InputPeerChat",
                  "SendMessageTypingAction", "DocumentAttributeFilename"):
-        setattr(tl_types, name, type(name, (), {"__init__":
-                                               lambda self, *a, **k: None}))
+        setattr(tl_types, name, type(name, (), {"__init__": _keep_kwargs}))
     tl.types = tl_types
 
     # telethon re-exports these at the top level, and the project imports them

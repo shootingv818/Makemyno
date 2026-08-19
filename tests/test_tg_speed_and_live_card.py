@@ -138,3 +138,101 @@ def test_the_loop_does_not_spin_forever_without_delay(monkeypatch, alice):
     monkeypatch.setattr(tg_panel.asyncio, "sleep", _sleep)
     asyncio.run(tg_panel._multi_progress_loop(alice, "job", _FakeMsg()))
     assert slept, "the loop must sleep between polls, never busy-spin"
+
+
+
+# --------------------------------------------------------------------------- #
+# 3. One fewer round-trip per recipient
+# --------------------------------------------------------------------------- #
+def test_discovery_captures_the_access_hash():
+    """A bare numeric id forces Telethon to RESOLVE the peer before sending, which
+    is an extra API round-trip per recipient whenever it is not cached. On a slow
+    link that dominates the send rate: the customer sets 0.2s and watches one
+    message leave every few seconds, with the time going to lookups."""
+    entity = types.SimpleNamespace(id=555, access_hash=999)
+    payload = multi._payload(entity, "user")
+    assert payload == {"kind": "user", "id": 555, "access_hash": 999}
+
+
+def test_a_peer_with_an_access_hash_needs_no_resolution():
+    peer = multi._peer({"kind": "user", "id": 555, "access_hash": 999})
+    assert peer.__class__.__name__ == "InputPeerUser"
+    assert peer.user_id == 555 and peer.access_hash == 999
+
+
+def test_a_group_peer_is_built_as_a_channel():
+    peer = multi._peer({"kind": "group", "id": 777, "access_hash": 888})
+    assert peer.__class__.__name__ == "InputPeerChannel"
+
+
+def test_a_target_without_an_access_hash_still_works():
+    """Jobs created before this existed must keep running, and the single-send
+    path hands in a real entity object rather than an id."""
+    assert multi._peer({"kind": "user", "id": 555}) == 555
+    entity = types.SimpleNamespace(id=1)
+    assert multi._peer({"kind": "user", "id": entity}) is entity
+
+
+def test_a_target_with_no_id_is_rejected_not_silently_skipped():
+    with pytest.raises(ValueError):
+        asyncio.run(multi._deliver(object(), {"kind": "user", "id": None},
+                                   [{"kind": "text", "text": "hi"}], 0.1))
+
+
+# --------------------------------------------------------------------------- #
+# 4. The send rate is measurable, so "slow" stops being a guess
+# --------------------------------------------------------------------------- #
+def test_send_timing_starts_empty(monkeypatch):
+    monkeypatch.setattr(multi, "_send_times", [])
+    assert multi.send_timing() == {"avg": 0.0, "last": 0.0, "n": 0}
+
+
+def test_send_timing_averages_recent_sends(monkeypatch):
+    monkeypatch.setattr(multi, "_send_times", [])
+    for value in (1.0, 2.0, 3.0):
+        multi.note_send_time(value)
+    timing = multi.send_timing()
+    assert timing["n"] == 3
+    assert timing["avg"] == 2.0
+    assert timing["last"] == 3.0
+
+
+def test_the_timing_window_is_bounded(monkeypatch):
+    """A long job must not accumulate an unbounded list."""
+    monkeypatch.setattr(multi, "_send_times", [])
+    for i in range(500):
+        multi.note_send_time(float(i))
+    assert len(multi._send_times) <= 200
+
+
+def test_deliver_records_how_long_telegram_took(monkeypatch):
+    monkeypatch.setattr(multi, "_send_times", [])
+
+    async def _send_text(client, entity, text, typing=0.0):
+        return None
+    monkeypatch.setattr(multi.tg, "send_text", _send_text)
+
+    asyncio.run(multi._deliver(object(), {"kind": "user", "id": 5},
+                               [{"kind": "text", "text": "hi"}], delay=0.2))
+    assert multi.send_timing()["n"] == 1
+
+
+def test_the_progress_card_separates_our_delay_from_the_network(monkeypatch,
+                                                               alice):
+    """The point of the whole thing: the card must show that a slow send is
+    Telegram's latency, not a setting the customer can lower."""
+    monkeypatch.setattr(multi, "_send_times", [])
+    multi.note_send_time(2.8)
+
+    job_id = db.tgm_create_job(alice, [{"kind": "text", "text": "hi"}], 0.2, "both")
+    card = multi.progress_card(alice, job_id)
+    assert "0.20s" in card, "the configured gap must be shown"
+    assert "2.80s" in card, "the platform's own cost must be shown"
+    assert "پیام در دقیقه" in card, "an actual rate makes it concrete"
+
+
+def test_the_card_omits_timing_before_any_send(monkeypatch, alice):
+    monkeypatch.setattr(multi, "_send_times", [])
+    job_id = db.tgm_create_job(alice, [{"kind": "text", "text": "hi"}], 0.2, "both")
+    card = multi.progress_card(alice, job_id)
+    assert "پیام در دقیقه" not in card

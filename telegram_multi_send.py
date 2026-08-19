@@ -62,6 +62,44 @@ def _target_key(entity) -> str:
     return str(uid) if uid is not None else str(entity)
 
 
+# Rolling record of how long the PLATFORM takes per message, so a slow send can
+# be attributed to the network instead of to our configured delay.
+_send_times: list = []
+
+
+def note_send_time(seconds: float) -> None:
+    _send_times.append(float(seconds))
+    if len(_send_times) > 200:
+        del _send_times[:-200]
+
+
+def send_timing() -> dict:
+    """Average/last seconds spent inside Telegram's API, over recent sends."""
+    if not _send_times:
+        return {"avg": 0.0, "last": 0.0, "n": 0}
+    return {"avg": sum(_send_times) / len(_send_times),
+            "last": _send_times[-1], "n": len(_send_times)}
+
+
+def _payload(entity, kind: str) -> dict:
+    """What we persist about a recipient.
+
+    The access_hash is the important part. A bare numeric id forces Telethon to
+    RESOLVE the peer before it can send, and when the entity is not in the session
+    cache that resolution is an extra API round-trip PER RECIPIENT. On a link with
+    real latency that alone can dominate the send rate — the customer sets a 0.2s
+    gap and watches one message leave every few seconds, with the time going to
+    lookups rather than to sending.
+
+    Captured here at discovery time, while we already hold the full entity.
+    """
+    return {
+        "kind": kind,
+        "id": getattr(entity, "id", None),
+        "access_hash": getattr(entity, "access_hash", None),
+    }
+
+
 def _is_flood(exc: BaseException) -> int:
     """Seconds to wait when Telegram asks us to slow down, else 0."""
     name = type(exc).__name__
@@ -167,18 +205,12 @@ async def _discover_targets(customer_id, acc: dict, target_mode: str) -> list:
         if target_mode in ("both", "contacts"):
             mutuals, others = await tg.get_contacts_ordered(client)
             for user in mutuals:
-                out.append((_target_key(user),
-                            {"kind": "user", "id": getattr(user, "id", None)},
-                            True))
+                out.append((_target_key(user), _payload(user, "user"), True))
             for user in others:
-                out.append((_target_key(user),
-                            {"kind": "user", "id": getattr(user, "id", None)},
-                            False))
+                out.append((_target_key(user), _payload(user, "user"), False))
         if target_mode in ("both", "groups"):
             for group in await tg.get_group_entities(client):
-                out.append((_target_key(group),
-                            {"kind": "group", "id": getattr(group, "id", None)},
-                            False))
+                out.append((_target_key(group), _payload(group, "group"), False))
         # de-duplicate inside one account's own list
         seen, unique = set(), []
         for item in out:
@@ -401,9 +433,33 @@ async def _run_account(customer_id, job_id, account: dict, control: dict) -> Non
         await asyncio.sleep(min(float(config.TABCHI_ACCOUNT_STAGGER), 30.0))
 
 
+def _peer(target: dict):
+    """The cheapest thing Telethon can send to.
+
+    With an access_hash we can hand Telethon a ready InputPeer and it sends
+    immediately. Without one it must resolve the id first, which is an extra API
+    round-trip per recipient whenever the entity is not cached — the difference
+    between a 0.2s gap and one message every few seconds on a slow link.
+
+    Falls back to the raw value, so a target stored before this existed (or an
+    entity object handed in by the single-send path) still works.
+    """
+    raw = target.get("id")
+    access_hash = target.get("access_hash")
+    if access_hash is None or not isinstance(raw, int):
+        return raw
+    try:
+        from telethon.tl import types
+        if (target.get("kind") or "user") == "user":
+            return types.InputPeerUser(user_id=raw, access_hash=access_hash)
+        return types.InputPeerChannel(channel_id=raw, access_hash=access_hash)
+    except Exception:      # noqa: BLE001 - resolution by id still works
+        return raw
+
+
 async def _deliver(client, target: dict, content: list, delay: float) -> None:
     """Send every configured content item to one recipient."""
-    entity = target.get("id")
+    entity = _peer(target)
     if entity is None:
         raise ValueError("target has no id")
     typing = 0.0
@@ -414,10 +470,16 @@ async def _deliver(client, target: dict, content: list, delay: float) -> None:
         kind = (item or {}).get("kind") or "text"
         text = (item or {}).get("text") or ""
         path = (item or {}).get("file_path") or ""
+        started = time.monotonic()
         if kind == "media" and path:
             await tg.send_media(client, entity, path, caption=text)
         else:
             await tg.send_text(client, entity, text, typing=typing)
+        # Measure what the PLATFORM costs us, separately from our own delay.
+        # "Sending feels slow" is unanswerable; "0.2s of delay and 2.8s waiting
+        # for Telegram" tells you immediately that the gap is the network, not a
+        # setting — and that no amount of lowering the speed will help.
+        note_send_time(time.monotonic() - started)
         if len(content) > 1:
             await asyncio.sleep(max(0.05, delay / 2))
 
@@ -460,6 +522,17 @@ def progress_card(customer_id, job_id) -> str:
         cards.kv("Skipped", cards.num(job.get("skipped_count") or 0)),
         cards.kv("Mutual first", cards.num(job.get("mutual_total") or 0)),
     ]
+    # Where the time actually goes. Without this, "sending is slow" is a guess:
+    # the configured gap and the platform's own latency are indistinguishable from
+    # the outside, and lowering the speed setting cannot fix a slow network.
+    timing = send_timing()
+    if timing["n"]:
+        gap = float(job.get("delay") or config.TG_SEND_DELAY)
+        per = timing["avg"] + gap
+        rows.append(cards.kv("Speed", f"{gap:.2f}s تنظیم‌شده"))
+        rows.append(cards.kv("Telegram", f"{timing['avg']:.2f}s در هر پیام"))
+        if per > 0:
+            rows.append(cards.kv("Rate", f"~{int(60 / per)} پیام در دقیقه"))
     if job.get("current_phone"):
         rows.append(cards.kv("Current", job["current_phone"]))
     rows.append(cards.LINE)
