@@ -96,3 +96,50 @@ def test_the_build_failure_report_is_wide_enough_for_the_real_cause():
     body = _src("worker.py")
     assert "[-1500:]" in body
     assert "out + \"\\n\" + err" in body, "both streams must be reported"
+
+
+
+# --------------------------------------------------------------------------- #
+# The worker image must survive a flaky apt mirror
+# --------------------------------------------------------------------------- #
+def test_the_apt_step_cannot_fail_the_image():
+    """Provisioning failed on a fresh VPS with a wall of apt output, while the
+    Python install would have worked fine: Pillow, cryptography and asyncssh all
+    ship manylinux wheels, so the system packages are a fallback nobody normally
+    needs. `|| true` keeps one bad mirror from killing the whole image."""
+    body = _src("Dockerfile")
+    apt_block = body[body.index("apt-get"):]
+    assert "|| true" in apt_block.split("COPY")[0], (
+        "the apt step must be best-effort, not load-bearing")
+
+
+def test_pip_is_upgraded_before_installing():
+    """An old pip may ignore a manylinux wheel and compile from source — which is
+    exactly when the optional apt packages become load-bearing."""
+    body = _src("Dockerfile")
+    assert body.index("pip install --upgrade pip") < body.index("-r requirements.txt")
+
+
+def test_pip_retries_on_a_flaky_network():
+    body = _src("Dockerfile")
+    assert "--retries" in body and "--timeout" in body
+
+
+def test_the_image_passes_the_role_as_an_argument():
+    """Same reasoning as the systemd unit: MODE from a shared env file must not be
+    able to override the role a container was started for."""
+    assert 'CMD ["python", "main.py", "worker"]' in _src("Dockerfile")
+    compose = _src("docker-compose.yml")
+    assert 'command: ["python", "main.py", "owner"]' in compose
+    assert 'command: ["python", "main.py", "customer"]' in compose
+
+
+def test_compose_does_not_set_mode():
+    """Compose lets `environment:` win over `env_file:` and systemd does the
+    opposite. Relying on that difference is what put the owner bot on both
+    services; neither should set the role through the environment now."""
+    for line in _src("docker-compose.yml").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        assert not stripped.startswith("MODE:"), "the role must be an argument"

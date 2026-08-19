@@ -182,3 +182,82 @@ def _no_name():
     r.user.first_name = ""
     r.user.last_name = ""
     return r
+
+
+
+# --------------------------------------------------------------------------- #
+# The contact count, read while the client is guaranteed live
+# --------------------------------------------------------------------------- #
+class _ContactfulClient(_FakeClient):
+    """A client that answers get_me and get_contacts like rubpy does."""
+
+    def __init__(self, contacts=3):
+        super().__init__()
+        self._contacts = contacts
+
+    async def get_me(self):
+        return _RubpyUser()
+
+    async def get_contacts(self, start_id=None):
+        users = []
+        for i in range(self._contacts):
+            u = _RubpyUser()
+            u.user_guid = f"c-{i}"
+            users.append(u)
+        return _Contacts(users)
+
+
+class _Contacts:
+    get = None                       # same landmine shape as the real payload
+
+    def __init__(self, users):
+        self.users = users
+
+
+def test_the_contact_count_is_read_after_login(ctx):
+    """The login card said "0 contacts" on an account with thousands, because
+    nothing ever counted them. This is the one moment a live client is
+    guaranteed, so it is counted here."""
+    ctx["client"] = _ContactfulClient(contacts=5)
+    info = asyncio.run(rb.finish_login(ctx, "12345"))
+    assert info["contacts"] == 5
+
+
+def test_the_identity_comes_from_get_me(ctx):
+    """get_me is stable across rubpy versions; the sign_in payload is not, which
+    is why the base project reads it this way."""
+    ctx["client"] = _ContactfulClient()
+    info = asyncio.run(rb.finish_login(ctx, "12345"))
+    assert info["guid"] == "u-123"
+    assert info["name"] == "Ali"
+
+
+def test_a_contact_read_that_fails_still_completes_the_login(ctx):
+    """A login must never be lost because the contact count could not be read —
+    the session is already valid at that point."""
+    class _Broken(_ContactfulClient):
+        async def get_contacts(self, start_id=None):
+            raise RuntimeError("network hiccup")
+
+    ctx["client"] = _Broken()
+    info = asyncio.run(rb.finish_login(ctx, "12345"))
+    assert info["contacts"] == 0
+    assert info["guid"], "the login itself must still have succeeded"
+
+
+def test_a_failing_get_me_falls_back_to_the_sign_in_payload(ctx):
+    class _NoMe(_ContactfulClient):
+        async def get_me(self):
+            raise RuntimeError("unavailable")
+
+    ctx["client"] = _NoMe()
+    info = asyncio.run(rb.finish_login(ctx, "12345"))
+    assert info["guid"] == "u-123", "the sign_in payload is the fallback"
+
+
+def test_contacts_is_always_an_int(ctx):
+    """rubika_panel does int(info.get("contacts") or 0) and then writes it to an
+    INTEGER column."""
+    ctx["client"] = _ContactfulClient(contacts=0)
+    info = asyncio.run(rb.finish_login(ctx, "12345"))
+    assert isinstance(info["contacts"], int)

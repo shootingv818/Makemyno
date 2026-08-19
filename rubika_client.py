@@ -215,14 +215,34 @@ async def finish_login(ctx: dict, code: str):
     # Rubika login died with "'NoneType' object is not callable" — pointing at the
     # db.add_account line, which sent three rounds of debugging after the wrong
     # suspect. The shape the callers want is the shape this returns.
+    #
+    # The identity comes from get_me(), not from the sign_in response: the base
+    # project reads it that way for a reason — sign_in's payload varies between
+    # rubpy versions, while get_me is stable and authoritative.
     guid = _guid_of(_get(result, "user")) or _guid_of(result) or ""
-    user = _get(result, "user")
-    name = _name_of(user, "") or ""
-    phone_out = _get(user, "phone") or phone
+    name = _name_of(_get(result, "user"), "") or ""
+    phone_out = _get(_get(result, "user"), "phone") or phone
+    try:
+        me = await client.get_me()
+        guid = _guid_of(me) or guid
+        name = _name_of(me, name) or name
+    except Exception:      # noqa: BLE001 - identity is a nicety, the login stands
+        pass
+
+    # Contact count, read here because this is the one moment we are guaranteed a
+    # live client. Without it the login card said "0 contacts" on an account with
+    # thousands, and the customer's first impression was a broken import.
+    contacts = 0
+    try:
+        contacts = len(await get_contacts_full(client))
+    except Exception:      # noqa: BLE001
+        pass
+
     return {
         "guid": guid,
         "name": name,
         "phone": phone_out,
+        "contacts": contacts,
         # The five portable values, so the account can be restored later from a
         # session token without another SMS code.
         "session_values": {

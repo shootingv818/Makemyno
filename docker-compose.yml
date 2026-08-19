@@ -10,8 +10,13 @@ services:
     container_name: makemyno-owner
     restart: always
     env_file: .env
-    environment:
-      MODE: owner
+    # The role is an ARGUMENT, not an environment variable.
+    #
+    # Compose happens to let `environment:` win over `env_file:`, but systemd does
+    # the opposite — and relying on that difference is what put the owner bot on
+    # both services in production, with one /start answering twice and the customer
+    # bot never starting at all. argv is immune to precedence rules in either.
+    command: ["python", "main.py", "owner"]
     volumes:
       - ./data:/app/data
 
@@ -21,8 +26,7 @@ services:
     container_name: makemyno-customer
     restart: always
     env_file: .env
-    environment:
-      MODE: customer
+    command: ["python", "main.py", "customer"]
     volumes:
       # The same data directory on purpose: both processes share customer.db
       # (WAL + busy_timeout make concurrent access safe) and the sessions folder.

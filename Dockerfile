@@ -1,6 +1,7 @@
 # Image used for BOTH bots and for every worker: one build, three roles.
-# MODE (owner | customer | worker) decides which one starts, so a worker can
-# never accidentally be given a bot token it does not have.
+# The role is passed as an argument to main.py (see deploy/makemyno.service.template
+# for why it must not come from the environment), so a worker can never be handed
+# a bot token it has no business holding.
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -9,19 +10,28 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Build deps for Pillow/reportlab wheels that may need compiling, plus the
-# minimum runtime libs. Removed again in the same layer to keep the image small.
-# `update || update` is a cheap retry: a fresh server often has one flaky apt
-# mirror on the first hit that succeeds on the second. --fix-missing rides out a
-# single unreachable package rather than failing the whole build.
-RUN (apt-get update -qq || apt-get update -qq) \
- && apt-get install -y --no-install-recommends --fix-missing \
-      gcc libjpeg62-turbo-dev zlib1g-dev libffi-dev \
- && rm -rf /var/lib/apt/lists/*
+# System packages are a FALLBACK ONLY, and this step must never fail the build.
+#
+# Pillow, cryptography and asyncssh all ship manylinux wheels, so on a normal
+# build nothing here is needed at all — it only matters if pip is forced to
+# compile. Meanwhile a fresh VPS routinely has one flaky apt mirror, and my
+# earlier version let that kill the whole image: provisioning failed with a wall
+# of apt output while the actual Python install would have worked fine.
+#
+# `|| true` is therefore deliberate, and matches what the base project learned
+# the same way.
+RUN (apt-get update -qq \
+     && apt-get install -y --no-install-recommends \
+        gcc libffi-dev libjpeg62-turbo-dev zlib1g-dev curl \
+     && rm -rf /var/lib/apt/lists/*) || true
 
+# Dependencies before the source, so editing code does not invalidate this layer.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
- && apt-get purge -y gcc libffi-dev && apt-get autoremove -y
+# Upgrading pip first matters: an old pip may ignore a manylinux wheel and try to
+# build from source, which is exactly when the apt step above becomes load-bearing.
+# The retries and longer timeout are for servers with slow or unreliable networks.
+RUN pip install --upgrade pip \
+ && pip install --retries 10 --timeout 120 -r requirements.txt
 
 # The .git directory is copied deliberately: a worker has no git binary, and
 # /ping reads the commit straight out of .git so the owner panel can show which
@@ -30,6 +40,10 @@ COPY . .
 
 # Sessions and job state live here; the host bind-mounts it so a container
 # rebuild never loses a login.
+RUN mkdir -p /app/data
 VOLUME ["/app/data"]
 
-CMD ["python", "main.py"]
+EXPOSE 8765
+
+# A worker. The two bots override this with their own role argument.
+CMD ["python", "main.py", "worker"]
