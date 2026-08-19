@@ -92,6 +92,7 @@ def main_menu() -> list:
          Button.inline("📈 آمار ورکرها", b"wstats")],
         [Button.inline("🔍 عیب‌یابی", b"diag"),
          Button.inline("💾 بکاپ", b"backupmenu")],
+        [Button.inline("🩺 موتور سلامت", b"healthreport")],
         [Button.inline("🧰 حالت تعمیر", b"maint"),
          Button.inline("⏸ توقف اضطراری", b"freeze")],
         [Button.inline("🛡 سپر ضداسپم", b"shield"),
@@ -1292,6 +1293,28 @@ async def shield_toggle_cb(event):
 # --------------------------------------------------------------------------- #
 # Diagnostics: look up a phone number
 # --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(data=b"healthreport"))
+async def health_report_cb(event):
+    """What the last health sweep found.
+
+    The engine itself runs in the CUSTOMER process, because the busy registry it
+    depends on is in memory where the jobs are. It parks its result in the shared
+    bot_state row, which is what this screen reads — the owner bot never runs a
+    sweep of its own.
+    """
+    if not is_owner(event):
+        return
+    import health
+    report = db.get_health_report()
+    rows = []
+    if report.get("dead_accounts"):
+        rows = [cards.LINE, "آخرین اکانت‌های سوخته:"] + [
+            f"🔴 {d}" for d in report["dead_accounts"][:12]]
+    await safe_edit(event, health.report_card() + ("\n".join(rows) if rows else ""),
+                    buttons=[[Button.inline("🔄 بازخوانی", b"healthreport")],
+                             _back(b"home")])
+
+
 @bot.on(events.CallbackQuery(data=b"diag"))
 async def diag_cb(event):
     if not is_owner(event):

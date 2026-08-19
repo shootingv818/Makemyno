@@ -468,7 +468,9 @@ async def amain() -> None:
     db.init()
 
     import account_conn
+    import health
     import rubika_panel
+    import tabchi
     import tg_panel
     import worker
 
@@ -483,15 +485,26 @@ async def amain() -> None:
 
     rubika_panel.setup(bot, state, _gate, safe_edit, respond, register_steps)
     tg_panel.setup(bot, state, _gate, safe_edit, respond, register_steps)
+    tabchi.setup(bot, state, _gate, safe_edit, respond, register_steps)
 
     # Resume interrupted work AND re-register it in the busy registry. Without
     # the second half a resumed job is invisible, and the next health pass opens
     # a second connection on top of it and kills the account.
     asyncio.create_task(rubika_panel.restore_pending())
     asyncio.create_task(tg_panel.restore_pending())
+    # Tabchi and the secretary are always-on features: a customer who switched
+    # them on expects them to survive a restart, and silently not resuming is
+    # indistinguishable from the feature being broken.
+    asyncio.create_task(tabchi.restore_engines())
 
     asyncio.create_task(notification_loop())
     asyncio.create_task(expiry_notice_loop())
+
+    # The health engine runs HERE, in the process that owns the jobs, because the
+    # busy registry is in memory. Running it in the owner bot would give it no
+    # view of what is mid-send — which is exactly how the base project's engine
+    # killed the sessions it was meant to be protecting.
+    health.start(notify=_on_invalid_auth)
 
     counts = db.owner_count_customers()
     await logbus.event("🤖 - #customer_bot_online", [
@@ -504,6 +517,8 @@ async def amain() -> None:
     try:
         await bot.run_until_disconnected()
     finally:
+        await health.stop()
+        await tabchi.stop_all()
         await account_conn.close_all()
 
 

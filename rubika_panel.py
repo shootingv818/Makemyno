@@ -1415,6 +1415,26 @@ def setup(bot, state, gate, safe_edit, respond, register_steps) -> None:
             return
         await _render_multi(event)
 
+    @bot.on(events.CallbackQuery(data=b"rbbrainsend"))
+    async def rb_brain_send(event):
+        """The shortcut off the brain report: the numbers were just added as
+        contacts, so the obvious next step is sending to them.
+
+        Every account that gained contacts is pre-selected, because the brain
+        works across accounts and re-ticking fifteen boxes by hand is pure
+        friction. The selection is still editable before launch.
+        """
+        if not await gate(event):
+            return
+        uid = event.sender_id
+        gained = [a["id"] for a in db.list_accounts(uid)
+                  if a["status"] == "active" and (a.get("contacts") or 0) > 0]
+        if not gained:
+            await event.answer("هنوز مخاطبی اضافه نشده.", alert=True)
+            return
+        _state.setdefault(uid, {})["multi"] = gained
+        await _render_multi(event)
+
     @bot.on(events.CallbackQuery(pattern=rb"rbmsel_(\d+)"))
     async def rb_multi_select(event):
         if not await gate(event, count_action=False):

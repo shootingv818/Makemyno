@@ -94,7 +94,21 @@ def _row(cur):
 # =========================================================================== #
 # Schema
 # =========================================================================== #
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+
+def _ensure_columns(cursor, table: str, columns: dict) -> None:
+    """Add columns that a newer version expects but an older database lacks.
+
+    `CREATE TABLE IF NOT EXISTS` silently skips an existing table, so a column
+    introduced later never appears on a database created by an earlier build, and
+    the first read of it crashes on startup. SQLite has no "ADD COLUMN IF NOT
+    EXISTS", so the existing columns are read first.
+    """
+    have = {r[1] for r in cursor.execute(f"PRAGMA table_info({table})")}
+    for name, spec in columns.items():
+        if name not in have:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
 
 
 def init() -> None:
@@ -233,10 +247,21 @@ def init() -> None:
             offline_at    TEXT DEFAULT '',
             offline_note  TEXT DEFAULT '',
             sends_frozen  INTEGER DEFAULT 0,
-            frozen_at     TEXT DEFAULT ''
+            frozen_at     TEXT DEFAULT '',
+            -- the last health sweep, so the owner's panel (a different process)
+            -- can show what the engine in the customer process found
+            health_report TEXT DEFAULT '',
+            health_at     TEXT DEFAULT ''
         )
     """)
     c.execute("INSERT OR IGNORE INTO bot_state (id, online) VALUES (1, 1)")
+    # CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so
+    # a column added in a later version never appears on an existing database and
+    # every read of it crashes. Adding columns is the one migration this schema
+    # actually needs, so it gets a helper rather than a hand-written ALTER each
+    # time somebody forgets.
+    _ensure_columns(c, "bot_state", {"health_report": "TEXT DEFAULT ''",
+                                     "health_at": "TEXT DEFAULT ''"})
 
     # ---- anti-tamper clock ------------------------------------------------ #
     c.execute("""
@@ -903,6 +928,26 @@ def get_account_by_phone(customer_id, phone: str) -> dict | None:
     return row
 
 
+def owner_all_accounts(status: str = "active", platform: str = "rb") -> list:
+    """Every account of every customer — for the health engine only.
+
+    Deliberately named `owner_` and deliberately the only unscoped reader of the
+    accounts table. The health engine is a service-wide sweep, so it genuinely
+    has no single customer to scope to; every other caller must go through
+    list_accounts(customer_id).
+    """
+    table = "tg_accounts" if platform == "tg" else "accounts"
+    conn = _conn()
+    sql = f"SELECT * FROM {table}"                       # noqa: S608 - fixed set
+    args: tuple = ()
+    if status:
+        sql += " WHERE status = ?"
+        args = (status,)
+    rows = _rows(conn.execute(sql + " ORDER BY customer_id, id", args))
+    conn.close()
+    return rows
+
+
 def count_accounts(customer_id) -> dict:
     cid = _require_cid(customer_id)
     conn = _conn()
@@ -1416,6 +1461,32 @@ def set_sends_frozen(frozen: bool) -> None:
                  (1 if frozen else 0, _now() if frozen else ""))
     conn.commit()
     conn.close()
+
+
+def set_health_report(report: dict) -> None:
+    """Park the last health sweep where the OWNER BOT can read it.
+
+    The engine runs in the customer process (it needs the in-memory busy
+    registry), but the owner's panel is a different process, so an in-memory
+    report would be invisible to the only person who wants it. One row in the
+    shared table is the whole bridge.
+    """
+    conn = _conn()
+    conn.execute("UPDATE bot_state SET health_report = ?, health_at = ? WHERE id = 1",
+                 (json.dumps(report, ensure_ascii=False), _now()))
+    conn.commit()
+    conn.close()
+
+
+def get_health_report() -> dict:
+    row = get_bot_state()
+    try:
+        report = json.loads(row.get("health_report") or "{}")
+    except (TypeError, ValueError):
+        return {}
+    if isinstance(report, dict) and row.get("health_at"):
+        report.setdefault("at", row["health_at"])
+    return report if isinstance(report, dict) else {}
 
 
 # =========================================================================== #
@@ -2008,6 +2079,10 @@ def tabchi_set(customer_id, account_id, **fields) -> None:
 
 def tabchi_incr_sent(customer_id, account_id, n: int = 1) -> None:
     cid = _require_cid(customer_id)
+    # The row is created lazily by tabchi_get, so without this an UPDATE can
+    # match zero rows and lose the count in total silence — the worst kind of
+    # counter bug, because the feature looks like it did nothing.
+    tabchi_get(cid, account_id)
     conn = _conn()
     conn.execute("UPDATE tabchi SET sent_total = sent_total + ?, updated_at = ? "
                  "WHERE account_id = ? AND customer_id = ?",
@@ -2244,6 +2319,7 @@ def secretary_set(customer_id, account_id, **fields) -> None:
 
 def secretary_incr(customer_id, account_id, n: int = 1) -> None:
     cid = _require_cid(customer_id)
+    secretary_get(cid, account_id)       # lazily-created row; see tabchi_incr_sent
     conn = _conn()
     conn.execute("UPDATE secretary SET replied_total = replied_total + ? "
                  "WHERE account_id = ? AND customer_id = ?",
@@ -2296,6 +2372,24 @@ def secretary_mark_replied(customer_id, account_id, target) -> None:
         (cid, int(account_id), str(target), _now()))
     conn.commit()
     conn.close()
+
+
+def secretary_replied_recent(customer_id, account_id, limit: int = 2000) -> list:
+    """The most recently answered targets, newest first.
+
+    A remote secretary pass runs on a worker, but this ledger stays on the master
+    so it survives a worker being rebuilt. The worker therefore has to be told
+    who to skip, and that list is capped because it crosses the tunnel on every
+    pass.
+    """
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT target FROM secretary_replied WHERE customer_id = ? "
+        "AND account_id = ? ORDER BY replied_at DESC, rowid DESC LIMIT ?",
+        (cid, int(account_id), max(1, int(limit)))).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
 
 
 def secretary_apply_to_all(customer_id, source_account_id) -> int:

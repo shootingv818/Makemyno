@@ -289,8 +289,14 @@ ACC_PAGE_SIZE = _int("ACC_PAGE_SIZE", 15)
 # --------------------------------------------------------------------------- #
 # Health / self-heal engine
 # --------------------------------------------------------------------------- #
+HEALTH_ENGINE_ENABLED = _bool("HEALTH_ENGINE_ENABLED", True)
 HEALTH_ENGINE_INTERVAL = _int("HEALTH_ENGINE_INTERVAL", 10800)   # 3 hours
 HEALTH_ENGINE_AUTODISABLE_DEAD = _bool("HEALTH_ENGINE_AUTODISABLE_DEAD", True)
+# Never sweep at boot: resumed jobs are still being re-registered in the busy
+# registry, and a sweep that beats them there probes accounts that are mid-job.
+HEALTH_ENGINE_WARMUP = _int("HEALTH_ENGINE_WARMUP", 300)
+# Pause between accounts, so a sweep is a trickle rather than a spike.
+HEALTH_ACCOUNT_GAP = _float("HEALTH_ACCOUNT_GAP", 1.5)
 # Tell the customer, in their own PV, when one of their accounts dies.
 NOTIFY_CUSTOMER_ON_DEAD = _bool("NOTIFY_CUSTOMER_ON_DEAD", True)
 # Alert the owner when this many accounts die inside DEAD_BURST_WINDOW seconds

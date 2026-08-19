@@ -21,7 +21,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # owner-only database.
 CUSTOMER_SIDE = [
     "customer_bot.py", "tg_panel.py", "tabchi.py", "rubika_panel.py",
-    "telegram_multi_send.py", "pdf_export.py", "help_text.py",
+    "telegram_multi_send.py", "pdf_export.py", "help_text.py", "health.py",
     "busy.py", "ratelimit.py", "antispam.py", "db.py", "cards.py", "logbus.py",
 ]
 
@@ -165,6 +165,9 @@ def test_owner_only_readers_are_named_with_the_owner_prefix():
         "init", "schema_version", "monotonic_now", "clock_tampered",
         "get_bot_state", "is_bot_online", "set_bot_online", "are_sends_frozen",
         "set_sends_frozen", "record_start", "recent_start_count",
+        # the health sweep is service-wide, and its result is handed to the owner
+        # bot through the shared state row rather than in memory
+        "set_health_report", "get_health_report",
         "clear_start_events", "session_pack", "session_unpack",
         "fetch_unsent_notifications", "mark_notification_sent",
         # customer-identified helpers that take the id as telegram_id
