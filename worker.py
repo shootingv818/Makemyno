@@ -38,9 +38,11 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 import secrets
 import time
 
+import cards
 import config
 import crypto_util
 import db
@@ -181,6 +183,13 @@ class SSHStepTimeout(TimeoutError):
     """A timeout that knows which step it belongs to."""
 
 
+# "Step 3/12 : RUN pip install ..." — the legacy builder's progress line. This is
+# only available because DOCKER_BUILDKIT=0 is pinned; BuildKit prints nothing
+# comparable, so the earlier decision to stay on the legacy builder pays for
+# itself twice.
+_STEP_RE = re.compile(r"^Step\s+(\d+)/(\d+)\s*:\s*(.*)$")
+
+
 # Patterns worth recognising, because each one has a different fix and guessing
 # sends the owner to the wrong place. The first version of this message assumed
 # "apt lock or no internet" for every failure; the real cause of one report was an
@@ -226,6 +235,106 @@ def _explain_setup_failure(out: str, err: str, ip: str = "") -> str:
             "   apt-get install -y docker.io && systemctl enable --now docker\n"
             "بعد دوباره «افزودن ورکر» را بزن.\n\n"
             "خروجی سرور:\n" + blob.strip()[-400:])
+
+
+async def _run_streaming(conn, command: str, on_line, timeout: float = None,
+                        label: str = ""):
+    """Run a command and hand every output line to `on_line` as it arrives.
+
+    A docker build takes five to fifteen minutes on a small VPS, and the card used
+    to say "this takes a few minutes" and then sit motionless. There was no way to
+    tell progress from a hang without opening a second SSH session, which is a poor
+    answer to "is it working?".
+
+    Returns (exit_status, tail) where `tail` is the last chunk of output, so a
+    failure can still be diagnosed by _explain_setup_failure.
+    """
+    lines: list = []
+
+    async def _pump():
+        # `create_process` streams; conn.run() only returns once the command has
+        # finished, which is what made live progress impossible.
+        async with conn.create_process(command) as proc:
+            async for raw in proc.stdout:
+                for line in str(raw).splitlines():
+                    line = line.rstrip()
+                    if not line:
+                        continue
+                    lines.append(line)
+                    # Bounded: a build prints thousands of lines and only the tail
+                    # is ever useful.
+                    if len(lines) > 400:
+                        del lines[:-400]
+                    try:
+                        await on_line(line)
+                    except Exception:      # noqa: BLE001 - reporting is best-effort
+                        pass
+            await proc.wait()
+            return proc.exit_status
+
+    try:
+        if timeout:
+            code = await asyncio.wait_for(_pump(), timeout=timeout)
+        else:
+            code = await _pump()
+    except asyncio.TimeoutError:
+        raise SSHStepTimeout(
+            f"مرحله‌ی «{label or 'دستور'}» بعد از {int(timeout)} ثانیه تمام نشد.\n"
+            f"آخرین خطوط:\n" + "\n".join(lines[-6:])) from None
+    return code, "\n".join(lines[-120:])
+
+
+def build_progress(line: str, state: dict) -> bool:
+    """Update `state` from one line of docker/pip output. True if it changed.
+
+    Docker's LEGACY builder prints "Step 3/12 : RUN ..." which gives an exact
+    fraction — a happy consequence of pinning DOCKER_BUILDKIT=0, since BuildKit
+    prints no such thing.
+
+    pip's own output fills the long gap inside the single slowest step, where the
+    step counter would otherwise sit still for many minutes.
+    """
+    changed = False
+    match = _STEP_RE.search(line)
+    if match:
+        state["step"] = int(match.group(1))
+        state["steps"] = int(match.group(2))
+        state["detail"] = match.group(3).strip()[:60]
+        state["sub"] = ""
+        return True
+
+    low = line.lower()
+    for prefix, label in (("collecting ", "دریافت"),
+                          ("downloading ", "دانلود"),
+                          ("building wheel for ", "ساخت"),
+                          ("installing collected packages", "نصب بسته‌ها")):
+        if low.startswith(prefix):
+            state["sub"] = (f"{label} {line[len(prefix):].strip()[:40]}"
+                            if prefix != "installing collected packages"
+                            else label)
+            changed = True
+            break
+    if "successfully built" in low or "successfully tagged" in low:
+        state["sub"] = "ایمیج ساخته شد"
+        changed = True
+    return changed
+
+
+def progress_card_rows(state: dict) -> list:
+    """The live build rows for the provisioning card."""
+    step = int(state.get("step") or 0)
+    steps = int(state.get("steps") or 0)
+    rows = []
+    if steps:
+        percent = int(round(100 * step / steps))
+        rows.append(f"{cards.bar(step, steps)}  {percent}%   ({step}/{steps})")
+    if state.get("detail"):
+        rows.append(f"▫️ {state['detail']}")
+    if state.get("sub"):
+        rows.append(f"   ↳ {state['sub']}")
+    elapsed = int(time.time() - float(state.get("started") or time.time()))
+    rows.append(f"⏱ {elapsed // 60}:{elapsed % 60:02d}")
+    return rows
 
 
 async def _run(conn, command: str, check: bool = False, timeout: float = None,
@@ -363,10 +472,29 @@ async def provision_worker(ip: str, ssh_port: int, ssh_user: str, ssh_pass: str,
         #
         # --network=host lets build steps use the server's own DNS, avoiding the
         # common "build container cannot resolve PyPI" failure on fresh servers.
-        code, out, err = await _run(
+        # Streamed, so the card shows a real percentage instead of sitting still
+        # for ten minutes while the owner wonders whether it has hung.
+        state = {"step": 0, "steps": 0, "detail": "", "sub": "",
+                 "started": time.time()}
+        last_sent = [0.0]
+
+        async def _on_line(line: str):
+            if not build_progress(line, state):
+                return
+            # Telegram rate-limits edits, so throttle rather than reporting every
+            # line of a build that prints thousands.
+            now = time.time()
+            if now - last_sent[0] < config.PROVISION_REPORT_EVERY:
+                return
+            last_sent[0] = now
+            await say("🏗 ساخت ایمیج Docker\n" + "\n".join(progress_card_rows(state)))
+
+        code, out = await _run_streaming(
             conn, f"cd {REMOTE_DIR} && DOCKER_BUILDKIT=0 "
-            f"docker build --network=host -t {IMAGE} .",
-            timeout=config.SSH_BUILD_TIMEOUT, label="ساخت ایمیج Docker")
+            f"docker build --network=host -t {IMAGE} . 2>&1",
+            _on_line, timeout=config.SSH_BUILD_TIMEOUT,
+            label="ساخت ایمیج Docker")
+        err = ""
         if code != 0:
             # Tail of BOTH streams, and wide enough that a deprecation banner
             # cannot push the real cause (a missing apt package, a DNS failure)

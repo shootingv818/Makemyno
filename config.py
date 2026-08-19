@@ -288,6 +288,10 @@ SSH_ADMIN_CONNECT_TIMEOUT = _int("SSH_ADMIN_CONNECT_TIMEOUT", 60)
 SSH_STEP_TIMEOUT = _int("SSH_STEP_TIMEOUT", 600)          # apt, git clone
 # A docker build on a small VPS legitimately takes many minutes.
 SSH_BUILD_TIMEOUT = _int("SSH_BUILD_TIMEOUT", 2400)       # 40 minutes
+# How often the provisioning card may be redrawn. A docker build prints thousands
+# of lines and Telegram rate-limits edits, so progress is throttled rather than
+# streamed line by line.
+PROVISION_REPORT_EVERY = _float("PROVISION_REPORT_EVERY", 4.0)
 
 TABCHI_MIN_INTERVAL = _int("TABCHI_MIN_INTERVAL", 10)
 TABCHI_MAX_INTERVAL = _int("TABCHI_MAX_INTERVAL", 86400)

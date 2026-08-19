@@ -1798,16 +1798,37 @@ async def _step_wk_pass(event, st):
 
 async def _provision(owner_id: int, msg, wk: dict) -> None:
     tag = worker.gen_tag()
-    lines = []
+    done: list = []          # completed steps, kept as history
+    live: list = []          # the step in progress, REPLACED on every update
+    last = [""]
 
     async def on_progress(text: str):
-        lines.append(text)
+        """Render the card: finished steps as history, the current one live.
+
+        Appending every update would turn a ten-minute build with a progress bar
+        into a hundred stacked copies of itself, so the live block is replaced
+        rather than added to. A multi-line update (the build's bar and percentage)
+        stays multi-line.
+        """
+        block = [ln for ln in str(text).splitlines() if ln.strip()]
+        if not block:
+            return
+        # A new headline means the previous step finished: promote it to history.
+        if live and live[0] != block[0]:
+            done.append(live[0])
+        live[:] = block
+
+        body = [
+            cards.kv("Server", f"{wk['ip']}:{wk['port']}"),
+            cards.kv("Tag", tag),
+            cards.LINE,
+        ] + done[-5:] + live
+        text_out = cards.card("🏗 - #provision_worker", body)
+        if text_out == last[0]:
+            return                       # Telegram rejects an identical edit
+        last[0] = text_out
         try:
-            await msg.edit(cards.card("🏗 - #provision_worker", [
-                cards.kv("Server", f"{wk['ip']}:{wk['port']}"),
-                cards.kv("Tag", tag),
-                cards.LINE,
-            ] + lines[-6:]))
+            await msg.edit(text_out)
         except Exception:
             pass
 
