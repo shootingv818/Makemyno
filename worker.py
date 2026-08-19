@@ -181,6 +181,53 @@ class SSHStepTimeout(TimeoutError):
     """A timeout that knows which step it belongs to."""
 
 
+# Patterns worth recognising, because each one has a different fix and guessing
+# sends the owner to the wrong place. The first version of this message assumed
+# "apt lock or no internet" for every failure; the real cause of one report was an
+# EXPIRED ROOT PASSWORD, which has nothing to do with either.
+_SETUP_HINTS = (
+    (("password has expired", "password change required"),
+     "پسورد root این سرور منقضی شده و لینوکس تا عوض نشود هیچ دستوری اجرا نمی‌کند.\n"
+     "چون SSH ما ترمینال تعاملی ندارد، خودش نمی‌تواند عوضش کند.\n"
+     "یک بار دستی وارد شو و پسورد را عوض کن، بعد «افزودن ورکر» را بزن:\n"
+     "   ssh root@{ip}\n"
+     "(سرورهای تازه‌ی Hetzner/OVH معمولاً همین حالت را دارند.)"),
+    (("permission denied", "authentication failed"),
+     "نام کاربری یا پسورد SSH درست نیست.\n"
+     "اگر سرور فقط کلید قبول می‌کند، ورود با پسورد را فعال کن."),
+    (("could not resolve", "temporary failure in name resolution",
+      "network is unreachable"),
+     "سرور به اینترنت وصل نیست یا DNS ندارد.\n"
+     "روی همان سرور تست کن:  ping -c1 deb.debian.org"),
+    (("no space left",),
+     "دیسک سرور پر است.\n"
+     "روی همان سرور:  df -h  و  docker system prune -af"),
+    (("could not get lock", "dpkg was interrupted"),
+     "قفل apt آزاد نشد (احتمالاً به‌روزرسانی خودکار در حال اجراست).\n"
+     "چند دقیقه صبر کن و دوباره امتحان کن، یا روی سرور:\n"
+     "   dpkg --configure -a"),
+)
+
+
+def _explain_setup_failure(out: str, err: str, ip: str = "") -> str:
+    """Turn the server's own output into a diagnosis with a fix.
+
+    A generic "probably the apt lock or no internet" was actively misleading: one
+    report was an expired root password, and the owner was pointed at apt.
+    """
+    blob = f"{out or ''}\n{err or ''}"
+    low = blob.lower()
+    for needles, advice in _SETUP_HINTS:
+        if any(n in low for n in needles):
+            return advice.format(ip=ip or "SERVER") + \
+                "\n\nخروجی سرور:\n" + blob.strip()[-400:]
+    return ("نصب Docker روی سرور کامل نشد.\n"
+            "روی همان سرور دستی بزن:\n"
+            "   apt-get install -y docker.io && systemctl enable --now docker\n"
+            "بعد دوباره «افزودن ورکر» را بزن.\n\n"
+            "خروجی سرور:\n" + blob.strip()[-400:])
+
+
 async def _run(conn, command: str, check: bool = False, timeout: float = None,
                label: str = ""):
     """Run a command over SSH -> (exit_status, out, err).
@@ -239,6 +286,15 @@ async def provision_worker(ip: str, ssh_port: int, ssh_user: str, ssh_pass: str,
         await say("🔌 اتصال SSH به سرور ...")
         conn = await _ssh_connect(ip, ssh_port, ssh_user, ssh_pass, keepalive=False)
 
+        # Check the account is actually usable BEFORE spending ten minutes on apt.
+        # An expired root password lets SSH authenticate and then refuses every
+        # command, so the first real failure surfaced ten minutes later disguised as
+        # a Docker problem.
+        code, out, err = await _run(conn, "echo READY", timeout=60,
+                                    label="بررسی دسترسی")
+        if "READY" not in (out or ""):
+            return {"ok": False, "error": _explain_setup_failure(out, err, ip)}
+
         await say("🐳 بررسی و نصب Docker ...")
         # A fresh Ubuntu box runs unattended-upgrades right after boot and holds
         # the dpkg lock for minutes. Without waiting for that lock the docker
@@ -266,12 +322,7 @@ async def provision_worker(ip: str, ssh_port: int, ssh_user: str, ssh_pass: str,
                                     timeout=config.SSH_STEP_TIMEOUT,
                                     label="نصب Docker")
         if "DOCKER_OK" not in (out or ""):
-            return {"ok": False,
-                    "error": ("نصب Docker روی سرور ناموفق بود (احتمالاً قفل apt یا "
-                              "نبود اینترنت). روی همون سرور دستی بزن: "
-                              "apt-get install -y docker.io && systemctl enable --now docker "
-                              "بعد دوباره «افزودن ورکر». جزئیات: "
-                              + ((err or out) or "")[-300:])}
+            return {"ok": False, "error": _explain_setup_failure(out, err, ip)}
 
         await say("📥 دریافت سورس ...")
         code, out, err = await _run(

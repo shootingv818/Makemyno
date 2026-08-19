@@ -182,3 +182,108 @@ def test_every_long_provisioning_step_is_bounded():
     for step in ("نصب Docker", "دریافت سورس", "ساخت ایمیج Docker",
                  "اجرای کانتینر"):
         assert f'label="{step}"' in body, f"{step} has no labelled timeout"
+
+
+
+# --------------------------------------------------------------------------- #
+# The diagnosis names the real cause, not a guess
+# --------------------------------------------------------------------------- #
+def test_an_expired_root_password_is_recognised():
+    """THE REPORT. The server said exactly what was wrong and the message replied
+    "probably the apt lock or no internet", sending the owner to apt for a
+    password problem."""
+    out = ("WARNING: Your password has expired.\n"
+           "Password change required but no TTY available.")
+    text = worker._explain_setup_failure("", out, "5.75.205.228")
+    assert "پسورد root" in text
+    assert "ssh root@5.75.205.228" in text, "it must give the exact command"
+    assert "apt" not in text.split("خروجی سرور")[0], (
+        "it must not blame apt for a password problem")
+
+
+def test_bad_credentials_are_recognised():
+    text = worker._explain_setup_failure("", "Permission denied (publickey).", "1.2.3.4")
+    assert "پسورد SSH" in text or "کاربری" in text
+
+
+def test_no_internet_is_recognised():
+    text = worker._explain_setup_failure(
+        "", "Temporary failure in name resolution", "1.2.3.4")
+    assert "اینترنت" in text or "DNS" in text
+    assert "ping" in text, "it should give something to run"
+
+
+def test_a_full_disk_is_recognised():
+    text = worker._explain_setup_failure("", "No space left on device", "1.2.3.4")
+    assert "دیسک" in text
+    assert "df -h" in text
+
+
+def test_an_apt_lock_is_still_recognised():
+    """The original guess was sometimes right — it just must not be the only
+    answer."""
+    text = worker._explain_setup_failure(
+        "", "Could not get lock /var/lib/dpkg/lock-frontend", "1.2.3.4")
+    assert "قفل apt" in text
+    assert "dpkg --configure" in text
+
+
+def test_an_unrecognised_failure_still_gives_a_next_step():
+    text = worker._explain_setup_failure("", "something odd happened", "1.2.3.4")
+    assert "docker.io" in text, "the manual fallback must still be offered"
+    assert "something odd happened" in text, "the raw output must be included"
+
+
+def test_the_server_output_is_always_attached():
+    """Whatever the diagnosis, the owner should see what the server actually
+    said — the guess may be wrong."""
+    for blob in ("Your password has expired", "No space left on device",
+                 "mystery failure"):
+        text = worker._explain_setup_failure("", blob, "1.2.3.4")
+        assert "خروجی سرور" in text
+        assert blob in text
+
+
+def test_the_output_is_truncated_so_one_failure_is_not_a_wall():
+    text = worker._explain_setup_failure("", "x" * 5000, "1.2.3.4")
+    assert len(text) < 1200
+
+
+def test_access_is_verified_before_the_long_install():
+    """An expired password authenticates fine and then refuses every command, so
+    the first real failure used to surface ten minutes later disguised as a Docker
+    problem."""
+    body = _src("worker.py")
+    start = body.index("async def provision_worker")
+    section = body[start:body.index("_SETUP_HINTS", start)] \
+        if "_SETUP_HINTS" in body[start:] else body[start:start + 6000]
+    check = section.index('label="بررسی دسترسی"')
+    install = section.index('label="نصب Docker"')
+    assert check < install, "the access check must come first"
+
+
+
+def test_the_docker_step_uses_the_diagnoser_too():
+    """Found by mutation: replacing only the Docker step's message with the old
+    "probably the apt lock" guess passed every test, because the earlier access
+    check still used the diagnoser. Both call sites have to be pinned.
+    """
+    body = _src("worker.py")
+    start = body.index("async def provision_worker")
+    section = body[start:start + 8000]
+    assert section.count("_explain_setup_failure") >= 2, (
+        "both the access check and the Docker step must diagnose properly")
+    # And the old guess must not come back anywhere.
+    for line in section.splitlines():
+        code = line.split("#")[0]
+        assert "احتمالاً قفل apt یا نبود اینترنت" not in code, (
+            "that guess was wrong for an expired password; use the diagnoser")
+
+
+def test_no_hardcoded_guess_survives_in_the_provisioning_path():
+    """The diagnosis belongs in one place, so a new failure mode is added once."""
+    body = _src("worker.py")
+    guesses = [ln.strip() for ln in body.splitlines()
+               if "قفل apt" in ln.split("#")[0]]
+    # The only mention should be inside the hint table.
+    assert len(guesses) <= 1, f"the guess is duplicated: {guesses}"
