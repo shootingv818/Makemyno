@@ -1,0 +1,422 @@
+"""
+telegram_client.py — Telegram userbot layer (Telethon) for YoudonoaAx.
+======================================================================
+
+This is the Telegram counterpart of rubika_client.py. It is fully ADDITIVE:
+it does not import or touch the Rubika side. Each Telegram account is a
+Telethon userbot whose session is stored (encrypted) in the DB as a
+StringSession, so accounts survive restarts and can be moved between servers.
+
+Login uses the SAME API_ID / API_HASH the panel bot already uses
+(config.API_ID / config.API_HASH) — no new credentials are required.
+
+Design mirrors account_conn.py: ONE warm client per account, reused across
+rounds, serialised by a per-account lock, with lazy reconnect. Telegram is
+aggressive about flood limits, so every public call is FloodWait-aware.
+"""
+from __future__ import annotations
+
+import asyncio
+import re
+
+from telethon import TelegramClient, functions, types
+from telethon.sessions import StringSession
+from telethon.errors import (
+    SessionPasswordNeededError,
+    FloodWaitError,
+    ChatWriteForbiddenError,
+    UserNotParticipantError,
+)
+
+import config
+import crypto_util
+import db
+
+
+# --------------------------------------------------------------------------- #
+# Warm client registry (one persistent client per account, like account_conn).
+# --------------------------------------------------------------------------- #
+_clients: dict = {}        # phone -> TelegramClient (connected, authorized)
+_locks: dict = {}          # phone -> asyncio.Lock
+
+
+def _lock(phone: str) -> asyncio.Lock:
+    lk = _locks.get(phone)
+    if lk is None:
+        lk = asyncio.Lock()
+        _locks[phone] = lk
+    return lk
+
+
+def _new_client(session_str: str = "") -> TelegramClient:
+    return TelegramClient(StringSession(session_str or None),
+                          config.API_ID, config.API_HASH)
+
+
+async def _save_session(phone: str, client: TelegramClient):
+    """Persist the (encrypted) StringSession for an account."""
+    try:
+        s = client.session.save()
+        db.tg_set_session(phone, crypto_util.encrypt(s))
+    except Exception:
+        pass
+
+
+async def get_client(phone: str) -> TelegramClient:
+    """Return a connected+authorized warm client for the account, opening it
+    lazily from the stored session. Raises if the account has no usable
+    session (needs re-login)."""
+    c = _clients.get(phone)
+    if c is not None and c.is_connected():
+        return c
+    acc = db.tg_get_account(phone)
+    if not acc or not acc.get("session"):
+        raise RuntimeError("no_session")
+    session_str = crypto_util.decrypt(acc["session"])
+    c = _new_client(session_str)
+    await c.connect()
+    if not await c.is_user_authorized():
+        try:
+            await c.disconnect()
+        except Exception:
+            pass
+        raise RuntimeError("unauthorized")
+    _clients[phone] = c
+    return c
+
+
+async def drop_client(phone: str):
+    c = _clients.pop(phone, None)
+    if c is not None:
+        try:
+            await c.disconnect()
+        except Exception:
+            pass
+
+
+async def close_all():
+    for phone in list(_clients.keys()):
+        await drop_client(phone)
+
+
+# --------------------------------------------------------------------------- #
+# FloodWait-aware call wrapper.
+# --------------------------------------------------------------------------- #
+async def safe_call(coro_factory, *, retries: int = 1):
+    """Run an awaitable; if Telegram answers FloodWaitError, wait the requested
+    seconds (capped) and retry once. `coro_factory` is a zero-arg function
+    returning a fresh awaitable each attempt."""
+    attempt = 0
+    while True:
+        try:
+            return await coro_factory()
+        except FloodWaitError as e:
+            wait = min(int(getattr(e, "seconds", 5)) + 1, config.TG_FLOOD_MAX_WAIT)
+            if attempt >= retries:
+                raise
+            attempt += 1
+            await asyncio.sleep(wait)
+
+
+# --------------------------------------------------------------------------- #
+# Login flow (phone -> code -> optional 2FA password).
+# --------------------------------------------------------------------------- #
+async def start_login(phone: str) -> dict:
+    """Begin login: connect a fresh client and request the SMS/app code.
+    Returns a ctx dict carried through the conversation."""
+    client = _new_client("")
+    await client.connect()
+    sent = await client.send_code_request(phone)
+    return {"client": client, "phone": phone,
+            "phone_code_hash": getattr(sent, "phone_code_hash", None)}
+
+
+async def finish_login(ctx: dict, code: str) -> dict:
+    """Sign in with the code. May raise SessionPasswordNeededError (-> 2FA)."""
+    client = ctx["client"]
+    await client.sign_in(ctx["phone"], code,
+                         phone_code_hash=ctx.get("phone_code_hash"))
+    return ctx
+
+
+async def finish_password(ctx: dict, password: str) -> dict:
+    client = ctx["client"]
+    await client.sign_in(password=password)
+    return ctx
+
+
+async def commit_login(ctx: dict) -> dict:
+    """After a successful sign-in: read account info, persist the session, and
+    register the warm client. Returns {phone, name, username, user_id,
+    contacts}."""
+    client = ctx["client"]
+    phone = ctx["phone"]
+    info = await account_info(client)
+    db.tg_upsert_account(phone, info.get("name", ""), info.get("username", ""),
+                         info.get("user_id"), info.get("contacts", 0),
+                         crypto_util.encrypt(client.session.save()))
+    _clients[phone] = client
+    return info
+
+
+# --------------------------------------------------------------------------- #
+# Account info.
+# --------------------------------------------------------------------------- #
+def _full_name(me) -> str:
+    parts = [getattr(me, "first_name", "") or "", getattr(me, "last_name", "") or ""]
+    return " ".join(p for p in parts if p).strip() or "—"
+
+
+async def account_info(client: TelegramClient) -> dict:
+    me = await client.get_me()
+    users = []
+    try:
+        res = await client(functions.contacts.GetContactsRequest(hash=0))
+        users = list(getattr(res, "users", []) or [])
+    except Exception:
+        users = []
+    mutuals = len([u for u in users if getattr(u, "mutual_contact", False)])
+    groups = 0
+    try:
+        async for d in client.iter_dialogs():
+            if getattr(d, "is_group", False):
+                groups += 1
+    except Exception:
+        groups = 0
+    return {
+        "user_id": getattr(me, "id", None),
+        "name": _full_name(me),
+        "username": getattr(me, "username", "") or "",
+        "phone": getattr(me, "phone", "") or "",
+        "contacts": len(users),
+        "mutuals": mutuals,
+        "groups": groups,
+    }
+
+
+async def get_contacts(client: TelegramClient) -> list:
+    res = await client(functions.contacts.GetContactsRequest(hash=0))
+    return list(getattr(res, "users", []) or [])
+
+
+async def get_mutual_contacts(client: TelegramClient) -> list:
+    """Only contacts who added the account back (mutual). Safest to message."""
+    users = await get_contacts(client)
+    return [u for u in users if getattr(u, "mutual_contact", False)]
+
+
+async def get_contacts_ordered(client: TelegramClient) -> tuple:
+    """Return (ordered_targets, mutual_count). Mutual contacts come FIRST, then
+    the remaining (non-mutual) contacts — so a send hits two-way contacts before
+    everyone else."""
+    users = await get_contacts(client)
+    mutuals = [u for u in users if getattr(u, "mutual_contact", False)]
+    rest = [u for u in users if not getattr(u, "mutual_contact", False)]
+    return mutuals + rest, len(mutuals)
+
+
+# --------------------------------------------------------------------------- #
+# Groups the account is a member of (tabchi targets).
+# --------------------------------------------------------------------------- #
+async def get_group_entities(client: TelegramClient) -> list:
+    out = []
+    async for d in client.iter_dialogs():
+        try:
+            if d.is_group:
+                out.append(d.entity)
+        except Exception:
+            continue
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Sending (text + media with caption) — FloodWait-aware. Optional human typing.
+# --------------------------------------------------------------------------- #
+async def _typing(client: TelegramClient, entity, seconds: float):
+    """Show a human-like typing indicator for `seconds` before sending."""
+    if seconds <= 0:
+        return
+    try:
+        async with client.action(entity, "typing"):
+            await asyncio.sleep(seconds)
+    except Exception:
+        await asyncio.sleep(seconds)
+
+
+async def send_text(client: TelegramClient, entity, text: str, typing: float = 0.0):
+    if typing > 0:
+        await _typing(client, entity, typing)
+    return await safe_call(lambda: client.send_message(entity, text))
+
+
+async def send_media(client: TelegramClient, entity, file_path: str,
+                     caption: str = "", typing: float = 0.0):
+    if typing > 0:
+        await _typing(client, entity, typing)
+    return await safe_call(
+        lambda: client.send_file(entity, file_path, caption=caption or None))
+
+
+async def send_content(client: TelegramClient, entity, text: str = "",
+                       file_path: str = "", caption: str = "", typing: float = 0.0):
+    """Send configured content: a media file with caption if file_path is set,
+    otherwise a plain text message."""
+    if file_path:
+        return await send_media(client, entity, file_path, caption or text, typing)
+    return await send_text(client, entity, text, typing)
+
+
+async def upload_to_saved(client: TelegramClient, file_path: str, caption: str = ""):
+    """Upload a media file ONCE to the account's own Saved Messages and return
+    the resulting Message. The file is then FORWARDED to every recipient, so it
+    is uploaded a single time instead of re-uploaded per chat (much faster)."""
+    return await safe_call(
+        lambda: client.send_file("me", file_path, caption=caption or None))
+
+
+async def forward_to(client: TelegramClient, entity, message):
+    """Forward an already-sent (Saved-Messages) message to a chat — no re-upload."""
+    return await safe_call(lambda: client.forward_messages(entity, message))
+
+
+async def send_saved_media(client: TelegramClient, entity, saved_msg, caption: str = ""):
+    """Re-send the media of an already-uploaded Saved-Messages message WITHOUT a
+    'Forwarded from' header and WITHOUT re-uploading the file (reuses the file
+    reference). Falls back to a plain forward if the build can't reuse media."""
+    media = getattr(saved_msg, "media", None)
+    if media is not None:
+        try:
+            return await safe_call(
+                lambda: client.send_file(entity, media, caption=caption or None))
+        except Exception:
+            pass
+    return await safe_call(lambda: client.forward_messages(entity, saved_msg))
+
+
+# --------------------------------------------------------------------------- #
+# Group / channel join + comment / forced-membership helpers (phases 3-5).
+# --------------------------------------------------------------------------- #
+_INVITE_RE = re.compile(r"(?:t\.me|telegram\.me)/(?:joinchat/|\+)([\w\-]+)",
+                        re.IGNORECASE)
+_PUBLIC_RE = re.compile(r"(?:t\.me|telegram\.me)/([A-Za-z][\w\d_]{3,})",
+                        re.IGNORECASE)
+_TG_LINK_RE = re.compile(
+    r"(?:https?://)?(?:t\.me|telegram\.me)/(?:joinchat/|\+)?[\w\-]+",
+    re.IGNORECASE)
+
+
+def extract_tg_links(text: str) -> list:
+    if not text:
+        return []
+    out, seen = [], set()
+    for m in _TG_LINK_RE.findall(text):
+        lk = m.rstrip("/")
+        if lk not in seen:
+            seen.add(lk)
+            out.append(lk)
+    return out
+
+
+async def join_link(client: TelegramClient, link: str):
+    """Join via private invite (t.me/+hash) or public username. Returns the
+    joined entity (or None)."""
+    link = (link or "").strip()
+    m = _INVITE_RE.search(link)
+    if m:
+        res = await safe_call(
+            lambda: client(functions.messages.ImportChatInviteRequest(m.group(1))))
+        chats = getattr(res, "chats", None)
+        return chats[0] if chats else None
+    m = _PUBLIC_RE.search(link)
+    uname = m.group(1) if m else link.lstrip("@")
+    ent = await client.get_entity(uname)
+    await safe_call(lambda: client(functions.channels.JoinChannelRequest(ent)))
+    return ent
+
+
+async def get_linked_discussion(client: TelegramClient, channel):
+    """Return the linked discussion-group entity of a channel (the place where
+    comments live), or None if the channel has comments disabled."""
+    try:
+        full = await client(functions.channels.GetFullChannelRequest(channel))
+        linked_id = getattr(full.full_chat, "linked_chat_id", None)
+        if linked_id:
+            return await client.get_entity(linked_id)
+    except Exception:
+        return None
+    return None
+
+
+async def ensure_can_write(client: TelegramClient, entity) -> bool:
+    """Try to guarantee the account can write in `entity`; join it if needed
+    (handles the common 'must join to send' / forced-membership case at the
+    API level). Returns True if writing should now be possible."""
+    try:
+        await client(functions.channels.JoinChannelRequest(entity))
+        return True
+    except UserNotParticipantError:
+        try:
+            await client(functions.channels.JoinChannelRequest(entity))
+            return True
+        except Exception:
+            return False
+    except ChatWriteForbiddenError:
+        return False
+    except Exception:
+        # not a channel (basic group) or already a member — assume writable
+        return True
+
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3/4 helpers: read a channel's recent messages + comment under a post.
+# --------------------------------------------------------------------------- #
+async def get_recent_messages(client: TelegramClient, entity, limit: int = 100) -> list:
+    out = []
+    try:
+        async for m in client.iter_messages(entity, limit=limit):
+            out.append(m)
+    except Exception:
+        pass
+    return out
+
+
+async def get_recent_post_ids(client: TelegramClient, channel, limit: int = 5) -> list:
+    """IDs of the most recent posts of a channel (newest first)."""
+    ids = []
+    try:
+        async for m in client.iter_messages(channel, limit=limit):
+            if getattr(m, "id", None):
+                ids.append(m.id)
+    except Exception:
+        pass
+    return ids
+
+
+async def comment_to_post(client: TelegramClient, channel, post_id: int, text: str,
+                          typing: float = 0.0):
+    """Post a comment under a channel post (Telethon routes it to the linked
+    discussion group via comment_to). If the account must first join the
+    discussion group, join it and retry once."""
+    async def _send():
+        return await client.send_message(channel, text, comment_to=post_id)
+    if typing > 0:
+        try:
+            await asyncio.sleep(typing)
+        except Exception:
+            pass
+    try:
+        return await safe_call(_send)
+    except Exception:
+        # forced membership: join the linked discussion group, then retry once.
+        disc = await get_linked_discussion(client, channel)
+        if disc is not None:
+            try:
+                await client(functions.channels.JoinChannelRequest(disc))
+            except Exception:
+                pass
+        return await safe_call(_send)
+
+
+async def entity_id(entity) -> int:
+    return getattr(entity, "id", None)
