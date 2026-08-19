@@ -264,13 +264,21 @@ async def get_mutual_contacts(client: TelegramClient) -> list:
 
 
 async def get_contacts_ordered(client: TelegramClient) -> tuple:
-    """Return (ordered_targets, mutual_count). Mutual contacts come FIRST, then
-    the remaining (non-mutual) contacts — so a send hits two-way contacts before
-    everyone else."""
+    """Return (mutuals, others) — TWO LISTS, mutuals first.
+
+    Both callers unpack this as `mutuals, others = ...` and iterate each, marking
+    the mutual ones so a send reaches them first (they added the account back, so
+    they are the least likely to report it).
+
+    This used to return (ordered_list, mutual_COUNT), and every caller unpacked
+    the count into `others` and then ran `for user in others` — a plain
+    `'int' object is not iterable` on the first real Telegram send. Two lists is
+    what the callers always wanted; the count is just len(mutuals).
+    """
     users = await get_contacts(client)
     mutuals = [u for u in users if getattr(u, "mutual_contact", False)]
-    rest = [u for u in users if not getattr(u, "mutual_contact", False)]
-    return mutuals + rest, len(mutuals)
+    others = [u for u in users if not getattr(u, "mutual_contact", False)]
+    return mutuals, others
 
 
 # --------------------------------------------------------------------------- #

@@ -213,8 +213,6 @@ async def _run_single(customer_id, acc: dict, msg=None) -> None:
         progress = None
         try:
             client = await tg.get_client(customer_id, aid)
-            targets = await multi._discover_targets(
-                customer_id, {**acc, "id": aid}, mode) if False else None
             # Enumerate here rather than through the job engine: this is the
             # simple single-account path and does not need persistence.
             mutuals, others = await tg.get_contacts_ordered(client)
