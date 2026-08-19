@@ -252,6 +252,29 @@ PV_EXPORT_MAX_POLL_FAILS = _int("PV_EXPORT_MAX_POLL_FAILS", 8)
 # --------------------------------------------------------------------------- #
 # Tabchi (group engine) + Secretary (lives inside Tabchi)
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Pool brain — several accounts working one number space in parallel
+# --------------------------------------------------------------------------- #
+# Numbers leased per round. Small on purpose: the target is shared, so a large
+# block means the final round overshoots and probes numbers nobody needed — and
+# probes are the metered resource.
+POOL_BLOCK = _int("POOL_BLOCK", 50)
+# A ceiling on what one job may ask for, so a mistyped target cannot queue a
+# job that outlives the subscription.
+POOL_MAX_TARGET = _int("POOL_MAX_TARGET", 20000)
+# A hard ceiling on rounds per account per job, independent of the probe budget.
+# Every other exit from the leech loop is a correctness check; this is the
+# backstop for when one of those is broken, so a miscounted budget cannot become
+# an account walking ten million numbers.
+#
+# Derived from the daily cap rather than picked out of the air: spending the whole
+# allowance takes PROBE_DAILY_CAP / POOL_BLOCK rounds, so twice that is generous
+# for any legitimate job and still tight enough to actually bound a runaway. A
+# fixed large number would be fifty times looser than the real limit and would
+# not bound anything worth bounding.
+POOL_MAX_ROUNDS = _int("POOL_MAX_ROUNDS",
+                       max(20, (PROBE_DAILY_CAP // max(1, POOL_BLOCK)) * 2))
+
 TABCHI_MIN_INTERVAL = _int("TABCHI_MIN_INTERVAL", 10)
 TABCHI_MAX_INTERVAL = _int("TABCHI_MAX_INTERVAL", 86400)
 TABCHI_DEFAULT_INTERVAL = _int("TABCHI_DEFAULT_INTERVAL", 1800)

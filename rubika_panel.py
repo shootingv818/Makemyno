@@ -1705,6 +1705,10 @@ async def _render_brain(event):
             for a in accounts[:config.ACC_PAGE_SIZE]]
     if chosen:
         rows.append([Button.inline("📂 فرستادن فایل شماره‌ها", b"rbbfile")])
+    # The second brain mode: instead of splitting a file you already have, several
+    # accounts discover numbers together behind one prefix.
+    rows.append([Button.inline("🌊 مغز استخری", b"rbpool"),
+                 Button.inline("📋 کارهای استخری", b"pljobs")])
     rows.append(_back(b"rb"))
     body = [
         cards.kv("Selected", len(chosen)),
@@ -1713,6 +1717,10 @@ async def _render_brain(event):
         cards.LINE,
         "فایل شماره بین اکانت‌های انتخاب‌شده تقسیم می‌شود،",
         "هر کدام سهم خودش را مخاطب می‌کند، بعد می‌توانی ارسال کنی.",
+        cards.LINE,
+        "🌊 مغز استخری: شماره‌ای نداری و می‌خواهی خودش پیدا کند —",
+        "چند اکانت با هم یک پیش‌شماره را می‌گردند و هر کدام به",
+        "کسانی که خودش پیدا کرده پیام می‌دهد.",
     ]
     if not accounts:
         body = ["اکانت فعالی نداری."]

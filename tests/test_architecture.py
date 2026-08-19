@@ -22,6 +22,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CUSTOMER_SIDE = [
     "customer_bot.py", "tg_panel.py", "tabchi.py", "rubika_panel.py",
     "telegram_multi_send.py", "pdf_export.py", "help_text.py", "health.py",
+    "pool.py",
     "busy.py", "ratelimit.py", "antispam.py", "db.py", "cards.py", "logbus.py",
 ]
 
@@ -168,6 +169,8 @@ def test_owner_only_readers_are_named_with_the_owner_prefix():
         # the health sweep is service-wide, and its result is handed to the owner
         # bot through the shared state row rather than in memory
         "set_health_report", "get_health_report",
+        # restart recovery for pool jobs — scoped again immediately after
+        "owner_pool_unfinished",
         "clear_start_events", "session_pack", "session_unpack",
         "fetch_unsent_notifications", "mark_notification_sent",
         # customer-identified helpers that take the id as telegram_id

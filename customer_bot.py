@@ -469,6 +469,7 @@ async def amain() -> None:
 
     import account_conn
     import health
+    import pool
     import rubika_panel
     import tabchi
     import tg_panel
@@ -486,12 +487,16 @@ async def amain() -> None:
     rubika_panel.setup(bot, state, _gate, safe_edit, respond, register_steps)
     tg_panel.setup(bot, state, _gate, safe_edit, respond, register_steps)
     tabchi.setup(bot, state, _gate, safe_edit, respond, register_steps)
+    pool.setup(bot, state, _gate, safe_edit, respond, register_steps)
 
     # Resume interrupted work AND re-register it in the busy registry. Without
     # the second half a resumed job is invisible, and the next health pass opens
     # a second connection on top of it and kills the account.
     asyncio.create_task(rubika_panel.restore_pending())
     asyncio.create_task(tg_panel.restore_pending())
+    # A pool job can represent hundreds of already-spent probes, so an unfinished
+    # one is resumed rather than abandoned.
+    asyncio.create_task(pool.restore_pending())
     # Tabchi and the secretary are always-on features: a customer who switched
     # them on expects them to survive a restart, and silently not resuming is
     # indistinguishable from the feature being broken.

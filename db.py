@@ -401,6 +401,64 @@ def init() -> None:
     c.execute("CREATE INDEX IF NOT EXISTS idx_cjobs_cid "
               "ON contact_jobs(customer_id, status)")
 
+    # ---- Pool brain: several accounts probing ONE number space in parallel -- #
+    # The suffix space is walked as an affine permutation rather than randomly,
+    # so leasing disjoint index ranges yields disjoint phone numbers with no
+    # collision checks at all. Random generation across parallel accounts would
+    # mean every account re-probing numbers another one already burned.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pool_jobs (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id   INTEGER NOT NULL,
+            prefix        TEXT,
+            target        INTEGER,
+            suffix_width  INTEGER,
+            affine_a      INTEGER,
+            affine_offset INTEGER,
+            cursor        INTEGER DEFAULT 0,
+            mode          TEXT DEFAULT 'text',
+            content       TEXT DEFAULT '',
+            status        TEXT DEFAULT 'leeching',
+            probed        INTEGER DEFAULT 0,
+            -- why leeching stopped: a fact about the job, since every account
+            -- hits the budget or the end of the space at the same moment
+            halt_reason   TEXT DEFAULT '',
+            created_at    TEXT,
+            updated_at    TEXT
+        )
+    """)
+    _ensure_columns(c, "pool_jobs", {"halt_reason": "TEXT DEFAULT ''"})
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pool_cid "
+              "ON pool_jobs(customer_id, status)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pool_job_accounts (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id      INTEGER NOT NULL,
+            customer_id INTEGER NOT NULL,
+            account_id  INTEGER NOT NULL,
+            phone       TEXT,
+            found       INTEGER DEFAULT 0,
+            sent        INTEGER DEFAULT 0,
+            status      TEXT DEFAULT 'active',
+            note        TEXT DEFAULT '',
+            UNIQUE(job_id, account_id)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pool_contacts (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id      INTEGER NOT NULL,
+            customer_id INTEGER NOT NULL,
+            account_id  INTEGER NOT NULL,
+            phone       TEXT,
+            guid        TEXT,
+            sent        INTEGER DEFAULT 0,
+            UNIQUE(job_id, guid)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pool_contacts "
+              "ON pool_contacts(job_id, account_id, sent)")
+
     # ---- Tabchi (group engine) + the Secretary that lives inside it -------- #
     c.execute("""
         CREATE TABLE IF NOT EXISTS tabchi (
@@ -778,16 +836,29 @@ def delete_customer(telegram_id) -> None:
     cid = _require_cid(telegram_id)
     conn = _conn()
     c = conn.cursor()
-    for table in ("accounts", "tg_accounts", "customer_settings", "tg_content",
-                  "usage_daily", "notifications", "paused_sends", "rb_sent",
-                  "tg_sent", "contact_jobs", "tabchi", "tabchi_texts",
-                  "tabchi_groups", "secretary", "secretary_replied", "tickets",
-                  "tg_multi_jobs", "tg_multi_accounts", "tg_multi_recipients"):
-        c.execute(f"DELETE FROM {table} WHERE customer_id = ?", (cid,))
-    c.execute("DELETE FROM rate_limit WHERE customer_id = ?", (cid,))
+    # Derived from the schema rather than hand-listed. A hand-written list has to
+    # be updated by whoever adds a feature, and the one time it is forgotten the
+    # deleted customer's rows stay behind forever — invisible, because nothing
+    # reads them. Asking sqlite which tables carry a customer_id cannot be
+    # forgotten.
+    for table in _customer_scoped_tables(c):
+        c.execute(f"DELETE FROM {table} WHERE customer_id = ?", (cid,))  # noqa: S608
     c.execute("DELETE FROM customers WHERE telegram_id = ?", (cid,))
     conn.commit()
     conn.close()
+
+
+def _customer_scoped_tables(cursor) -> list:
+    """Every table with a customer_id column."""
+    names = [r[0] for r in cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND name NOT LIKE 'sqlite_%'")]
+    scoped = []
+    for name in names:
+        columns = {r[1] for r in cursor.execute(f"PRAGMA table_info({name})")}
+        if "customer_id" in columns:
+            scoped.append(name)
+    return scoped
 
 
 # ---- owner-only readers (unscoped BY DESIGN, hence the owner_ prefix) ------ #
@@ -1002,17 +1073,27 @@ def delete_account(customer_id, account_id) -> None:
     conn = _conn()
     c = conn.cursor()
     c.execute("DELETE FROM accounts WHERE id = ? AND customer_id = ?", (aid, cid))
-    for table in ("tabchi", "secretary"):
-        c.execute(f"DELETE FROM {table} WHERE account_id = ? AND customer_id = ?",
-                  (aid, cid))
-    for table in ("tabchi_texts", "tabchi_groups", "secretary_replied",
-                  "rb_sent", "contact_jobs"):
-        c.execute(f"DELETE FROM {table} WHERE account_id = ? AND customer_id = ?",
-                  (aid, cid))
-    c.execute("DELETE FROM paused_sends WHERE account_id = ? AND customer_id = ?",
-              (aid, cid))
+    # Same reasoning as delete_customer: derived from the schema, because the
+    # hand-written version of this list had already fallen behind the code. Note
+    # the tg_* tables key account_id against a DIFFERENT table (tg_accounts), so
+    # they are excluded — a Rubika account id must not delete a Telegram one.
+    for table in _account_scoped_tables(c):
+        c.execute(f"DELETE FROM {table} WHERE account_id = ? "        # noqa: S608
+                  "AND customer_id = ?", (aid, cid))
     conn.commit()
     conn.close()
+
+
+def _account_scoped_tables(cursor) -> list:
+    """Tables holding rows that belong to ONE Rubika account."""
+    scoped = []
+    for name in _customer_scoped_tables(cursor):
+        if name.startswith("tg_") or name == "accounts":
+            continue
+        columns = {r[1] for r in cursor.execute(f"PRAGMA table_info({name})")}
+        if "account_id" in columns:
+            scoped.append(name)
+    return scoped
 
 
 # ---- portable session blob (encrypted at rest) ---------------------------- #
@@ -1542,6 +1623,236 @@ def probe_budget_left(customer_id) -> int:
 
 def probe_spend(customer_id, n: int = 1) -> int:
     return usage_incr(customer_id, "probe", n)
+
+
+# =========================================================================== #
+# Pool brain — several accounts leeching ONE shared number space in parallel
+# =========================================================================== #
+def pool_create_job(customer_id, prefix: str, target: int, suffix_width: int,
+                    affine_a: int, affine_offset: int, mode: str, content: str,
+                    accounts: list) -> int:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO pool_jobs (customer_id, prefix, target, suffix_width, "
+        "affine_a, affine_offset, cursor, mode, content, status, created_at, "
+        "updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 'leeching', ?, ?)",
+        (cid, str(prefix), int(target), int(suffix_width), int(affine_a),
+         int(affine_offset), str(mode), str(content or ""), _now(), _now()))
+    job_id = cur.lastrowid
+    for acc in accounts:
+        cur.execute(
+            "INSERT OR IGNORE INTO pool_job_accounts (job_id, customer_id, "
+            "account_id, phone) VALUES (?, ?, ?, ?)",
+            (job_id, cid, int(acc["id"]), acc["phone"]))
+    conn.commit()
+    conn.close()
+    return job_id
+
+
+def pool_get_job(customer_id, job_id) -> dict | None:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    row = _row(conn.execute(
+        "SELECT * FROM pool_jobs WHERE id = ? AND customer_id = ?",
+        (int(job_id), cid)))
+    conn.close()
+    return row
+
+
+def pool_set_status(customer_id, job_id, status: str) -> None:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    conn.execute("UPDATE pool_jobs SET status = ?, updated_at = ? "
+                 "WHERE id = ? AND customer_id = ?",
+                 (str(status), _now(), int(job_id), cid))
+    conn.commit()
+    conn.close()
+
+
+def pool_lease_block(customer_id, job_id, size: int) -> tuple:
+    """Hand out the next `size` indices of the number space, atomically.
+
+    This is the heart of the parallelism. Several accounts ask at the same
+    moment, and each must get a range nobody else has: the read and the bump
+    happen in ONE immediate transaction, so two accounts cannot both see the same
+    cursor and probe the same numbers twice.
+    """
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    try:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        row = _row(conn.execute(
+            "SELECT cursor, probed FROM pool_jobs WHERE id = ? AND customer_id = ?",
+            (int(job_id), cid)))
+        if not row:
+            conn.execute("ROLLBACK")
+            return (0, 0)
+        start = int(row["cursor"] or 0)
+        conn.execute("UPDATE pool_jobs SET cursor = ?, updated_at = ? WHERE id = ?",
+                     (start + int(size), _now(), int(job_id)))
+        conn.execute("COMMIT")
+        return (start, start + int(size))
+    finally:
+        conn.close()
+
+
+def pool_set_halt(customer_id, job_id, reason: str) -> None:
+    """Record why leeching stopped, first writer wins.
+
+    Several accounts notice the same wall at almost the same moment. The first
+    reason is the true one; later ones are echoes, and letting them overwrite
+    would report "reached target" for a job that actually ran out of budget.
+    """
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    conn.execute("UPDATE pool_jobs SET halt_reason = ? WHERE id = ? "
+                 "AND customer_id = ? AND (halt_reason IS NULL OR halt_reason = '')",
+                 (str(reason), int(job_id), cid))
+    conn.commit()
+    conn.close()
+
+
+def pool_incr_probed(customer_id, job_id, n: int) -> None:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    conn.execute("UPDATE pool_jobs SET probed = probed + ?, updated_at = ? "
+                 "WHERE id = ? AND customer_id = ?",
+                 (int(n), _now(), int(job_id), cid))
+    conn.commit()
+    conn.close()
+
+
+def pool_accounts(customer_id, job_id) -> list:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    rows = _rows(conn.execute(
+        "SELECT * FROM pool_job_accounts WHERE job_id = ? AND customer_id = ? "
+        "ORDER BY id", (int(job_id), cid)))
+    conn.close()
+    return rows
+
+
+def pool_set_account(customer_id, job_id, account_id, **fields) -> None:
+    cid = _require_cid(customer_id)
+    allowed = {"found", "sent", "status", "note"}
+    sets, params = [], []
+    for key, value in fields.items():
+        if key in allowed:
+            sets.append(f"{key} = ?")
+            params.append(value)
+    if not sets:
+        return
+    params += [int(job_id), int(account_id), cid]
+    conn = _conn()
+    conn.execute(
+        f"UPDATE pool_job_accounts SET {', '.join(sets)} WHERE job_id = ? "
+        "AND account_id = ? AND customer_id = ?", params)
+    conn.commit()
+    conn.close()
+
+
+def pool_add_contact(customer_id, job_id, account_id, phone: str, guid: str) -> bool:
+    """Record a hit. False if this guid is already in the job.
+
+    The UNIQUE(job_id, guid) is what stops two accounts from both counting — and
+    later both messaging — the same person when their blocks happen to contain
+    two numbers belonging to one user.
+    """
+    cid = _require_cid(customer_id)
+    if not guid:
+        return False
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO pool_contacts (job_id, customer_id, account_id, "
+        "phone, guid) VALUES (?, ?, ?, ?, ?)",
+        (int(job_id), cid, int(account_id), str(phone), str(guid)))
+    added = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return added
+
+
+def pool_hit_count(customer_id, job_id) -> int:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    row = _row(conn.execute(
+        "SELECT COUNT(*) AS n FROM pool_contacts WHERE job_id = ? "
+        "AND customer_id = ?", (int(job_id), cid)))
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+def pool_account_guids(customer_id, job_id, account_id,
+                       unsent_only: bool = False) -> list:
+    cid = _require_cid(customer_id)
+    sql = ("SELECT guid, phone FROM pool_contacts WHERE job_id = ? "
+           "AND customer_id = ? AND account_id = ?")
+    if unsent_only:
+        sql += " AND sent = 0"
+    conn = _conn()
+    rows = _rows(conn.execute(sql + " ORDER BY id",
+                              (int(job_id), cid, int(account_id))))
+    conn.close()
+    return rows
+
+
+def pool_mark_sent(customer_id, job_id, guid: str) -> None:
+    """Only CONFIRMED deliveries land here, which is what makes a resumed job
+    pick up where it stopped instead of messaging people twice."""
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    conn.execute("UPDATE pool_contacts SET sent = 1 WHERE job_id = ? "
+                 "AND customer_id = ? AND guid = ?",
+                 (int(job_id), cid, str(guid)))
+    conn.commit()
+    conn.close()
+
+
+def pool_counts(customer_id, job_id) -> dict:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    row = _row(conn.execute(
+        "SELECT COUNT(*) AS found, COALESCE(SUM(sent), 0) AS sent "
+        "FROM pool_contacts WHERE job_id = ? AND customer_id = ?",
+        (int(job_id), cid)))
+    conn.close()
+    return {"found": int((row or {}).get("found") or 0),
+            "sent": int((row or {}).get("sent") or 0)}
+
+
+def pool_list_jobs(customer_id, limit: int = 10) -> list:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    rows = _rows(conn.execute(
+        "SELECT * FROM pool_jobs WHERE customer_id = ? ORDER BY id DESC LIMIT ?",
+        (cid, int(limit))))
+    conn.close()
+    return rows
+
+
+def owner_pool_unfinished() -> list:
+    """Jobs that were mid-flight when the process died — restart recovery only."""
+    conn = _conn()
+    rows = _rows(conn.execute(
+        "SELECT * FROM pool_jobs WHERE status IN ('leeching', 'sending') "
+        "ORDER BY id"))
+    conn.close()
+    return rows
+
+
+def pool_delete_job(customer_id, job_id) -> None:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    for table in ("pool_contacts", "pool_job_accounts", "pool_jobs"):
+        column = "id" if table == "pool_jobs" else "job_id"
+        conn.execute(f"DELETE FROM {table} WHERE {column} = ? AND customer_id = ?",
+                     (int(job_id), cid))
+    conn.commit()
+    conn.close()
 
 
 def owner_usage_totals(day: str = None) -> dict:
