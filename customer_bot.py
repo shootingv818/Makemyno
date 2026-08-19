@@ -466,6 +466,7 @@ async def amain() -> None:
         raise SystemExit("تنظیمات ناقص است (.env): " + ", ".join(problems))
 
     db.init()
+    _assert_db_api()
 
     import account_conn
     import health
@@ -525,6 +526,45 @@ async def amain() -> None:
         await health.stop()
         await tabchi.stop_all()
         await account_conn.close_all()
+
+
+def _assert_db_api() -> None:
+    """Fail at BOOT if any database entry point is missing or not callable.
+
+    A production report showed `db.add_account(...)` raising
+    "'NoneType' object is not callable" while a fresh import of the same file
+    proved it was a healthy function — the classic signature of stale bytecode or
+    a half-imported module. Chasing that took several rounds because the only
+    evidence arrived after a customer had already hit it.
+
+    This turns that whole class of problem into one loud line at startup, before
+    any customer can reach it, and names the exact attribute that is broken
+    instead of leaving a mystery in a traceback.
+    """
+    required = [
+        "init", "add_account", "get_account", "list_accounts", "delete_account",
+        "get_account_by_phone", "set_status", "set_session_blob",
+        "set_account_contacts", "incr_account_sent", "count_accounts",
+        "ensure_customer", "get_customer", "is_active", "is_blocked",
+        "seconds_left", "touch_customer",
+        "get_setting", "set_setting", "get_marker", "get_max_errors",
+        "mark_sent", "was_sent", "sent_targets", "usage_incr",
+        "probe_budget_left", "probe_spend",
+        "tabchi_get", "tabchi_set", "secretary_get", "secretary_set",
+        "pool_create_job", "pool_lease_block", "pool_add_contact",
+        "tgm_create_job", "tgm_get_job", "tgm_update_job",
+        "is_bot_online", "are_sends_frozen", "add_ticket",
+    ]
+    broken = [name for name in required
+              if not callable(getattr(db, name, None))]
+    if broken:
+        raise SystemExit(
+            "db API ناقص است: " + ", ".join(broken) + "\n"
+            f"فایل بارگذاری‌شده: {getattr(db, '__file__', '?')}\n"
+            "معمولاً یعنی bytecode کهنه است. این را بزن:\n"
+            "  find /opt/makemyno -name '__pycache__' -type d "
+            "-exec rm -rf {} +\n"
+            "  systemctl restart makemyno-customer")
 
 
 async def _on_invalid_auth(customer_id, phone: str) -> None:
