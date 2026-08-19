@@ -1,0 +1,50 @@
+[Unit]
+Description=Makemyno {{ROLE}} bot
+# The two bots are independent processes with independent tokens, so neither
+# waits for the other. They only need the network.
+After=network-online.target
+Wants=network-online.target
+
+# Restart, but not in a tight loop: five failures in two minutes means the
+# problem is configuration, not luck, and flapping only buries the real error
+# under thousands of identical log lines.
+#
+# These two belong in [Unit], not [Service]. systemd moved them in v229 and
+# silently ignores them if they sit under [Service] — so the rate limit would
+# look configured and do nothing.
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+[Service]
+Type=simple
+WorkingDirectory={{APP_DIR}}
+EnvironmentFile={{APP_DIR}}/.env
+# Overrides MODE from the .env: one file, two roles.
+Environment=MODE={{ROLE}}
+Environment=PYTHONUNBUFFERED=1
+ExecStart={{APP_DIR}}/.venv/bin/python {{APP_DIR}}/main.py
+
+# A bot that dies at 3am must come back on its own.
+Restart=always
+RestartSec=10
+
+# Give in-flight work a chance to finish. The shutdown path releases session
+# claims and closes clients; killing it instantly leaves the settle delay
+# unhonoured, which is exactly what revokes a session on the next start.
+KillSignal=SIGINT
+TimeoutStopSec=45
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=makemyno-{{ROLE}}
+
+# Modest hardening. Not a sandbox — the process legitimately writes its own
+# database and session files under {{APP_DIR}}/data.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths={{APP_DIR}}
+
+[Install]
+WantedBy=multi-user.target
