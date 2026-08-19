@@ -298,8 +298,10 @@ def test_the_house_divider_survived_everywhere():
 
 def test_no_payment_or_pricing_code_exists():
     """«اون قیمت گذاری تراکنش ایناهم نساز اصن»"""
+    # "gateway" is deliberately absent: it matches "502 Bad Gateway" in the
+    # worker's transient-error list, which is HTTP, not money.
     banned = ["trx", "tron", "usdt", "invoice", "price", "payment", "wallet",
-              "tether", "zarinpal", "gateway"]
+              "tether", "zarinpal", "paygate", "merchant"]
     hits = {}
     for name in ALL_MODULES:
         for line in _src(name).splitlines():

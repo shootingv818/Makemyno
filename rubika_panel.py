@@ -980,17 +980,15 @@ async def _run_export(customer_id, acc: dict, msg=None) -> None:
                 import account_conn
 
                 async def _work(client):
-                    return await rb.get_contacts_full(client)
+                    # get_contact_phones, NOT get_contacts_full: the latter has no
+                    # phone field, so this loop used to read item["phone"] off
+                    # dicts that never carried it and produced an empty export
+                    # every single time, without an error to show why.
+                    return await rb.get_contact_phones(client)
 
-                contacts = await account_conn.call(customer_id, phone, _work,
-                                                  timeout=600)
-                seen = set()
-                for item in contacts or []:
-                    digits = "".join(ch for ch in str(item.get("phone") or "")
-                                     if ch.isdigit())
-                    if digits and digits not in seen:
-                        seen.add(digits)
-                        numbers.append(digits)
+                got = await account_conn.call(customer_id, phone, _work,
+                                             timeout=600)
+                numbers.extend(str(p) for p in (got or []))
         except Exception as exc:  # noqa: BLE001
             code = await logbus.error(exc, context=f"rb export {phone}",
                                       customer=customer_id, notify=False)

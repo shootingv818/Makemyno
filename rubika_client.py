@@ -349,6 +349,67 @@ def _next_start_id(result):
     return _get(result, "next_start_id") or _get(result, "next_start_index")
 
 
+def _phone_of(obj):
+    """Best-effort extraction of a contact's phone number.
+
+    Rubika contact objects carry the number you added them by, under one of
+    several key names depending on the payload shape.
+    """
+    # _get first: rubpy hands back objects with attributes, and _data_of only
+    # understands dicts and to_dict payloads — it returns {} for a plain object, so
+    # a dict-only lookup would silently find nothing on the shape that actually
+    # arrives.
+    direct = _get(obj, "phone", "phone_number", "phone_no")
+    if direct:
+        return str(direct)
+    user = _get(obj, "user")
+    if user is not None:
+        nested = _get(user, "phone", "phone_number", "phone_no")
+        if nested:
+            return str(nested)
+    return ""
+
+
+async def get_contact_phones(client: Client, should_stop=None,
+                             on_progress=None) -> list:
+    """An ordered, de-duplicated list of contact phone numbers, digits only.
+
+    Ported from the reference project because contact export was quietly broken
+    without it: the export read get_contacts_full(), whose dicts carry
+    {guid, name, last_online, online} and NO phone, so `item.get("phone")` was
+    always None and every export returned zero numbers. Nothing errored — the
+    customer just got an empty file.
+
+    `should_stop` is checked between pages so a long export can be cancelled;
+    `on_progress` reports the running count for a live card.
+    """
+    out: list = []
+    seen = set()
+    start_id = None
+    for _ in range(200):          # safety cap: 200 * ~100 = 20k contacts
+        if should_stop is not None and should_stop():
+            break
+        result = await client.get_contacts(start_id) if start_id \
+            else await client.get_contacts()
+        users = getattr(result, "users", None)
+        if users is None and isinstance(result, dict):
+            users = result.get("users", [])
+        for user in users or []:
+            digits = "".join(ch for ch in _phone_of(user) if ch.isdigit())
+            if digits and digits not in seen:
+                seen.add(digits)
+                out.append(digits)
+        if on_progress is not None:
+            try:
+                await on_progress(len(out))
+            except Exception:      # noqa: BLE001 - progress is best-effort
+                pass
+        start_id = _next_start_id(result)
+        if not start_id or not users:
+            break
+    return out
+
+
 async def get_contacts_full(client: Client) -> list:
     """Return ALL contacts as dicts {guid, name, last_online, online}, paginated."""
     out = []

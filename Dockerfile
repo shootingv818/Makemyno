@@ -36,9 +36,15 @@ COPY requirements.txt .
 # telethon is pure Python and publishes a ready wheel; pip only fell back to
 # building because an index mirror served the sdist first. --prefer-binary tells it
 # to take the wheel wherever one exists.
+# `-i https://pypi.org/simple` is NOT redundant, and both reference projects carry
+# it for a reason I rediscovered the hard way: a server can ship a pip.conf
+# pointing at a local mirror, and a mirror that serves the sdist instead of the
+# wheel makes pip COMPILE telethon from source — thousands of files through
+# bdist_wheel, which on a small VPS is slow enough to look hung and can fill the
+# disk outright. Naming the index explicitly removes that variable.
 RUN pip install --upgrade pip \
  && pip install --prefer-binary --retries 10 --timeout 180 \
-      -r requirements.txt
+      -i https://pypi.org/simple -r requirements.txt
 
 # The .git directory is copied deliberately: a worker has no git binary, and
 # /ping reads the commit straight out of .git so the owner panel can show which

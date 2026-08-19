@@ -218,6 +218,27 @@ _SETUP_HINTS = (
 )
 
 
+# Failures that are the registry or the network having a bad minute, not anything
+# wrong with the server. These are worth retrying; a full disk or a broken
+# Dockerfile is not, and retrying those only wastes ten more minutes.
+_TRANSIENT_BUILD = (
+    "502 bad gateway", "503 service unavailable", "504 gateway",
+    "httpreadseeker", "unexpected status from get request",
+    "temporary failure", "connection reset by peer", "i/o timeout",
+    "tls handshake timeout", "net/http: request canceled",
+    "failed to copy", "unexpected eof",
+)
+
+
+def _is_transient_build_error(output: str) -> bool:
+    low = (output or "").lower()
+    # A full disk can appear alongside a copy failure; never treat that as
+    # transient, because retrying cannot help and the real cause would be buried.
+    if "no space left" in low:
+        return False
+    return any(needle in low for needle in _TRANSIENT_BUILD)
+
+
 def _explain_setup_failure(out: str, err: str, ip: str = "") -> str:
     """Turn the server's own output into a diagnosis with a fix.
 
@@ -460,6 +481,44 @@ async def provision_worker(ip: str, ssh_port: int, ssh_user: str, ssh_pass: str,
         await _run(conn, f"mkdir -p {REMOTE_DATA}")
         await _run(conn, f"cat > {REMOTE_DIR}/.env <<'ENVEOF'\n{env_lines}ENVEOF")
 
+        # PRE-FLIGHT: free disk, before spending ten minutes discovering there
+        # isn't any. A build needs room for the base image, the wheels and pip's
+        # temp files; one report died with "[Errno 28] No space left on device"
+        # deep inside a pip build, where the real cause is easy to miss.
+        await say("💾 بررسی فضای دیسک ...")
+        _code, out, _err = await _run(
+            conn, "df -Pm / | awk 'NR==2{print $4}'", timeout=60,
+            label="بررسی دیسک")
+        free_mb = 0
+        try:
+            free_mb = int((out or "0").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            free_mb = 0
+        if free_mb and free_mb < config.WORKER_MIN_DISK_MB:
+            # Try to make room from our own leftovers first: a failed build leaves
+            # dangling layers behind, and several failed attempts add up.
+            await say(f"🧹 فضا کم است ({free_mb}MB) — پاک‌سازی داکر ...")
+            await _run(conn, "docker system prune -af --volumes || true",
+                       timeout=config.SSH_STEP_TIMEOUT, label="پاک‌سازی داکر")
+            _code, out, _err = await _run(
+                conn, "df -Pm / | awk 'NR==2{print $4}'", timeout=60,
+                label="بررسی دیسک")
+            try:
+                free_mb = int((out or "0").strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                free_mb = 0
+            if free_mb < config.WORKER_MIN_DISK_MB:
+                return {"ok": False, "error": (
+                    f"فضای دیسک سرور کافی نیست: {free_mb}MB آزاد، "
+                    f"حداقل {config.WORKER_MIN_DISK_MB}MB لازم است.\n"
+                    "ساخت ایمیج به فضا برای ایمیج پایه، بسته‌ها و فایل‌های موقت "
+                    "pip نیاز دارد.\n"
+                    "روی همان سرور:\n"
+                    "   df -h\n"
+                    "   docker system prune -af --volumes\n"
+                    "اگر باز کم بود، دیسک سرور را بزرگ‌تر کن.")}
+            await say(f"✅ فضا آزاد شد ({free_mb}MB)")
+
         await say("🏗 ساخت ایمیج Docker (چند دقیقه طول می‌کشه) ...")
         # The LEGACY builder, deliberately.
         #
@@ -489,18 +548,46 @@ async def provision_worker(ip: str, ssh_port: int, ssh_user: str, ssh_pass: str,
             last_sent[0] = now
             await say("🏗 ساخت ایمیج Docker\n" + "\n".join(progress_card_rows(state)))
 
-        code, out = await _run_streaming(
-            conn, f"cd {REMOTE_DIR} && DOCKER_BUILDKIT=0 "
-            f"docker build --network=host -t {IMAGE} . 2>&1",
-            _on_line, timeout=config.SSH_BUILD_TIMEOUT,
-            label="ساخت ایمیج Docker")
+        # Retry a TRANSIENT failure. Docker Hub returns 502 often enough to matter,
+        # and one report failed on exactly that while pulling the base image — a
+        # working server reported as a defeat. Only transient causes are retried:
+        # retrying a full disk or a broken Dockerfile just wastes ten minutes.
+        code, out = 1, ""
+        for attempt in range(1, config.WORKER_BUILD_ATTEMPTS + 1):
+            if attempt > 1:
+                wait = 15 * attempt
+                await say(f"🔁 تلاش {attempt} از {config.WORKER_BUILD_ATTEMPTS} "
+                          f"(خطای موقت رجیستری) — {wait}s صبر ...")
+                await asyncio.sleep(wait)
+                state.update({"step": 0, "steps": 0, "detail": "", "sub": "",
+                              "started": time.time()})
+            code, out = await _run_streaming(
+                conn, f"cd {REMOTE_DIR} && DOCKER_BUILDKIT=0 "
+                f"docker build --network=host -t {IMAGE} . 2>&1",
+                _on_line, timeout=config.SSH_BUILD_TIMEOUT,
+                label="ساخت ایمیج Docker")
+            if code == 0 or not _is_transient_build_error(out):
+                break
         err = ""
         if code != 0:
             # Tail of BOTH streams, and wide enough that a deprecation banner
             # cannot push the real cause (a missing apt package, a DNS failure)
             # out of the report.
-            detail = (out + "\n" + err).strip()[-1500:]
-            return {"ok": False, "error": f"docker build شکست خورد:\n{detail}"}
+            # Run it through the diagnoser too. A build failure has the same set of
+            # underlying causes as a setup failure — a full disk, no DNS — and one
+            # report dumped 1500 characters of pip traceback with "No space left on
+            # device" buried in the middle where it was easy to miss.
+            detail = (out + "\n" + err).strip()
+            if _is_transient_build_error(detail):
+                return {"ok": False, "error": (
+                    "ساخت ایمیج به‌خاطر خطای موقت رجیستری داکر شکست خورد "
+                    f"(بعد از {config.WORKER_BUILD_ATTEMPTS} تلاش).\n"
+                    "این مشکل سرور تو نیست — Docker Hub جواب نداد.\n"
+                    "چند دقیقه بعد دوباره «افزودن ورکر» را بزن.\n\n"
+                    "خروجی سرور:\n" + detail[-500:])}
+            return {"ok": False,
+                    "error": "ساخت ایمیج Docker شکست خورد.\n\n"
+                             + _explain_setup_failure(out, err, ip)}
 
         await say("🚀 اجرای کانتینر ...")
         run_cmd = (

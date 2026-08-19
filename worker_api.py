@@ -532,17 +532,15 @@ def build_app():
             import account_conn
 
             async def _work(client):
-                return await rb.get_contacts_full(client)
+                # get_contact_phones, NOT get_contacts_full: the latter returns
+                # {guid, name, last_online, online} with no phone at all, so the
+                # old code read item["phone"] off dicts that never had it and
+                # every export came back empty without erroring.
+                return await rb.get_contact_phones(client)
 
-            contacts = await account_conn.call(body.customer_id, body.phone,
-                                               _work, timeout=600)
-            phones, seen = [], set()
-            for item in contacts or []:
-                digits = "".join(ch for ch in str(item.get("phone") or "")
-                                 if ch.isdigit())
-                if digits and digits not in seen:
-                    seen.add(digits)
-                    phones.append(digits)
+            phones = await account_conn.call(body.customer_id, body.phone,
+                                             _work, timeout=600)
+            phones = [str(p) for p in (phones or [])]
             return {"ok": True, "phones": phones, "count": len(phones)}
         except Exception as exc:
             raise HTTPException(status_code=400,

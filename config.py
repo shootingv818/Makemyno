@@ -292,6 +292,14 @@ SSH_BUILD_TIMEOUT = _int("SSH_BUILD_TIMEOUT", 2400)       # 40 minutes
 # of lines and Telegram rate-limits edits, so progress is throttled rather than
 # streamed line by line.
 PROVISION_REPORT_EVERY = _float("PROVISION_REPORT_EVERY", 4.0)
+# Free megabytes a server needs before a build is worth attempting. The base image
+# is ~150MB, the wheels a few hundred more, and pip's temp files a few hundred
+# again. Below this the build dies deep inside pip with "[Errno 28] No space left
+# on device", where the real cause is easy to miss.
+WORKER_MIN_DISK_MB = _int("WORKER_MIN_DISK_MB", 2500)
+# Docker Hub answers 502 often enough to matter. A transient registry failure is
+# not a broken server, so the build is retried rather than reported as a defeat.
+WORKER_BUILD_ATTEMPTS = _int("WORKER_BUILD_ATTEMPTS", 3)
 
 TABCHI_MIN_INTERVAL = _int("TABCHI_MIN_INTERVAL", 10)
 TABCHI_MAX_INTERVAL = _int("TABCHI_MAX_INTERVAL", 86400)
@@ -362,7 +370,11 @@ WORKER_SECRET = os.getenv("WORKER_SECRET", "").strip()
 # an older repo makes "update all workers" silently downgrade the fleet.
 GIT_REPO_URL = os.getenv(
     "GIT_REPO_URL", "https://github.com/shootingv818/Makemyno").strip()
-GIT_BRANCH = os.getenv("GIT_BRANCH", "main").strip()
+# The branch a worker clones. NOT "main": main carries only a README, so a worker
+# built from it would clone a repository with no Dockerfile and no code — a silent
+# way to make every provision fail for a reason that looks like anything else.
+# Whatever branch the master is running is the branch its workers must run.
+GIT_BRANCH = os.getenv("GIT_BRANCH", "feat/multi-tenant-foundation").strip()
 
 WORKER_API_PORT = _int("WORKER_API_PORT", 8765)
 WORKER_BIND_HOST = os.getenv("WORKER_BIND_HOST", "0.0.0.0").strip()

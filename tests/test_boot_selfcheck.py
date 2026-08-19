@@ -94,8 +94,12 @@ def test_the_worker_build_does_not_require_buildx():
 def test_the_build_failure_report_is_wide_enough_for_the_real_cause():
     """A deprecation banner used to push the actual apt error out of the tail."""
     body = _src("worker.py")
-    assert "[-1500:]" in body
-    assert "out + \"\\n\" + err" in body, "both streams must be reported"
+    # Both streams, and enough of them that a deprecation banner cannot push the
+    # real cause out of the report. The build path now runs its tail through the
+    # diagnoser instead of dumping a fixed slice.
+    assert 'out + "\\n" + err' in body, "both streams must be reported"
+    assert "_explain_setup_failure(out, err" in body, (
+        "a build failure must be diagnosed, not dumped raw")
 
 
 
