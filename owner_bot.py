@@ -1816,15 +1816,18 @@ async def _provision(owner_id: int, msg, wk: dict) -> None:
         tag=tag, on_progress=on_progress)
 
     if not result.get("ok"):
-        await logbus.event("❌ - #worker_provision_failed", [
-            cards.kv("Server", wk["ip"]),
-            cards.kv("Error", str(result.get("error"))[:300]),
-        ])
+        # The error is often several lines: which step failed, and what to check
+        # on the server. cards.kv() collapses that into one truncated line, which
+        # is how a report arrived saying only "TimeoutError:" — so the lines are
+        # kept as lines.
+        detail = str(result.get("error") or "خطای نامشخص").strip()
+        body = [cards.kv("Server", wk["ip"]), cards.LINE] + \
+            detail.splitlines()[:12]
+        await logbus.event("❌ - #worker_provision_failed", body)
         try:
-            await msg.edit(cards.card("❌ - #provision_failed", [
-                cards.kv("Server", wk["ip"]),
-                cards.kv("Error", str(result.get("error"))[:400]),
-            ]), buttons=[_back(b"workers")])
+            await msg.edit(cards.card("❌ - #provision_failed", body),
+                           buttons=[[Button.inline("🔁 تلاش دوباره", b"wk_add")],
+                                    _back(b"workers")])
         except Exception:
             pass
         return

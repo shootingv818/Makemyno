@@ -147,19 +147,59 @@ async def _ssh_connect(ip: str, port: int, user: str, password: str,
         base["keepalive_interval"] = 15
         base["keepalive_count_max"] = 3
 
+    # A one-shot admin operation gets a generous window; the health tunnel keeps a
+    # tight one so a dead link is noticed quickly.
+    #
+    # Provisioning used to share the tunnel's 10 seconds, and that is how a
+    # provision attempt died with a bare "TimeoutError": the server was still busy
+    # from the previous build, SSH login took longer than ten seconds, and the
+    # report named neither the step nor the limit.
+    budget = config.SSH_CONNECT_TIMEOUT if keepalive \
+        else config.SSH_ADMIN_CONNECT_TIMEOUT
+    base["login_timeout"] = max(8, budget - 2)
+
     async def _do():
         try:
-            return await asyncssh.connect(connect_timeout=8, **base)
+            return await asyncssh.connect(connect_timeout=max(8, budget - 2), **base)
         except TypeError:
             # older asyncssh without the connect_timeout kwarg
             return await asyncssh.connect(**base)
 
-    return await asyncio.wait_for(_do(), timeout=10)
+    try:
+        return await asyncio.wait_for(_do(), timeout=budget)
+    except asyncio.TimeoutError:
+        # Say what timed out and what to check. A bare TimeoutError sent the owner
+        # looking in the wrong place more than once.
+        raise SSHStepTimeout(
+            f"اتصال SSH به {ip}:{port} در {budget} ثانیه برقرار نشد.\n"
+            f"معمولاً یعنی سرور تحت فشار است (ساخت قبلی هنوز در حال اجراست) یا "
+            f"پورت/فایروال مسیر را بسته.\n"
+            f"روی همان سرور بررسی کن:  uptime  و  docker ps") from None
 
 
-async def _run(conn, command: str, check: bool = False):
-    """Run a command over an open SSH connection -> (exit_status, out, err)."""
-    res = await conn.run(command, check=check)
+class SSHStepTimeout(TimeoutError):
+    """A timeout that knows which step it belongs to."""
+
+
+async def _run(conn, command: str, check: bool = False, timeout: float = None,
+               label: str = ""):
+    """Run a command over SSH -> (exit_status, out, err).
+
+    `timeout` bounds a single command so one wedged step cannot hang provisioning
+    forever, and `label` puts the step's name in the error instead of leaving the
+    owner with an unattributed TimeoutError.
+    """
+    try:
+        if timeout:
+            res = await asyncio.wait_for(conn.run(command, check=check),
+                                         timeout=timeout)
+        else:
+            res = await conn.run(command, check=check)
+    except asyncio.TimeoutError:
+        raise SSHStepTimeout(
+            f"مرحله‌ی «{label or 'دستور'}» بعد از {int(timeout)} ثانیه تمام نشد.\n"
+            f"احتمالاً سرور کم‌قدرت است یا شبکه‌اش کند. روی همان سرور نگاه کن:  "
+            f"docker ps -a  و  df -h") from None
     return res.exit_status, (res.stdout or ""), (res.stderr or "")
 
 
@@ -222,7 +262,9 @@ async def provision_worker(ip: str, ssh_port: int, ssh_user: str, ssh_pass: str,
             "if command -v docker >/dev/null 2>&1; then docker --version; "
             "echo DOCKER_OK; else echo DOCKER_MISSING; fi\n"
         )
-        code, out, err = await _run(conn, install_script)
+        code, out, err = await _run(conn, install_script,
+                                    timeout=config.SSH_STEP_TIMEOUT,
+                                    label="نصب Docker")
         if "DOCKER_OK" not in (out or ""):
             return {"ok": False,
                     "error": ("نصب Docker روی سرور ناموفق بود (احتمالاً قفل apt یا "
@@ -237,6 +279,7 @@ async def provision_worker(ip: str, ssh_port: int, ssh_user: str, ssh_pass: str,
             f"rm -rf {REMOTE_DIR} && "
             f"git clone --depth 1 -b {config.GIT_BRANCH} "
             f"{config.GIT_REPO_URL} {REMOTE_DIR}",
+            timeout=config.SSH_STEP_TIMEOUT, label="دریافت سورس",
         )
         if code != 0:
             return {"ok": False,
@@ -271,7 +314,8 @@ async def provision_worker(ip: str, ssh_port: int, ssh_user: str, ssh_pass: str,
         # common "build container cannot resolve PyPI" failure on fresh servers.
         code, out, err = await _run(
             conn, f"cd {REMOTE_DIR} && DOCKER_BUILDKIT=0 "
-            f"docker build --network=host -t {IMAGE} .")
+            f"docker build --network=host -t {IMAGE} .",
+            timeout=config.SSH_BUILD_TIMEOUT, label="ساخت ایمیج Docker")
         if code != 0:
             # Tail of BOTH streams, and wide enough that a deprecation banner
             # cannot push the real cause (a missing apt package, a DNS failure)
@@ -287,7 +331,9 @@ async def provision_worker(ip: str, ssh_port: int, ssh_user: str, ssh_pass: str,
             f"--env-file {REMOTE_DIR}/.env "
             f"-v {REMOTE_DATA}:/app/data {IMAGE}"
         )
-        code, out, err = await _run(conn, run_cmd)
+        code, out, err = await _run(conn, run_cmd,
+                                    timeout=config.SSH_STEP_TIMEOUT,
+                                    label="اجرای کانتینر")
         if code != 0:
             return {"ok": False,
                     "error": f"docker run شکست خورد: {err[:200] or out[:200]}"}
@@ -295,8 +341,20 @@ async def provision_worker(ip: str, ssh_port: int, ssh_user: str, ssh_pass: str,
         await say("✅ نصب کامل شد.")
         return {"ok": True, "tag": tag, "api_port": api_port,
                 "api_token": api_token}
+    except SSHStepTimeout as e:
+        # These already explain themselves, including which step and what to
+        # check. Do NOT reduce them to a type name.
+        return {"ok": False, "error": str(e)}
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+        # A bare `TimeoutError:` with nothing after it was a real report, and it
+        # sent the owner looking in the wrong place. An exception with no message
+        # gets a description of what was being attempted instead.
+        detail = str(e).strip()
+        if not detail:
+            detail = ("بدون پیام. معمولاً یعنی اتصال SSH وسط کار قطع شد — "
+                      "سرور تحت فشار یا شبکه ناپایدار. روی همان سرور: "
+                      "uptime، free -h، docker ps -a")
+        return {"ok": False, "error": f"{type(e).__name__}: {detail[:400]}"}
     finally:
         if conn is not None:
             try:
@@ -349,7 +407,8 @@ async def update_worker(worker: dict) -> tuple:
             f"docker run -d --name {CONTAINER} --restart always --network=host "
             f"--env-file {REMOTE_DIR}/.env -v {REMOTE_DATA}:/app/data {IMAGE}"
         )
-        return await _run(conn, cmd)
+        return await _run(conn, cmd, timeout=config.SSH_BUILD_TIMEOUT,
+                          label="به‌روزرسانی ورکر")
     finally:
         conn.close()
 

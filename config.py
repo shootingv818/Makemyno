@@ -275,6 +275,20 @@ POOL_MAX_TARGET = _int("POOL_MAX_TARGET", 20000)
 POOL_MAX_ROUNDS = _int("POOL_MAX_ROUNDS",
                        max(20, (PROBE_DAILY_CAP // max(1, POOL_BLOCK)) * 2))
 
+# --------------------------------------------------------------------------- #
+# SSH timeouts — two budgets, because the two uses are nothing alike
+# --------------------------------------------------------------------------- #
+# The health tunnel: tight, so a dead link is noticed within seconds.
+SSH_CONNECT_TIMEOUT = _int("SSH_CONNECT_TIMEOUT", 10)
+# One-shot admin work (provision / update / backup): generous. A server that is
+# mid-docker-build takes far longer than ten seconds to answer an SSH login, and
+# sharing the tunnel's budget is how provisioning died with a bare TimeoutError.
+SSH_ADMIN_CONNECT_TIMEOUT = _int("SSH_ADMIN_CONNECT_TIMEOUT", 60)
+# Per-step ceilings, so one wedged command cannot hang provisioning forever.
+SSH_STEP_TIMEOUT = _int("SSH_STEP_TIMEOUT", 600)          # apt, git clone
+# A docker build on a small VPS legitimately takes many minutes.
+SSH_BUILD_TIMEOUT = _int("SSH_BUILD_TIMEOUT", 2400)       # 40 minutes
+
 TABCHI_MIN_INTERVAL = _int("TABCHI_MIN_INTERVAL", 10)
 TABCHI_MAX_INTERVAL = _int("TABCHI_MAX_INTERVAL", 86400)
 TABCHI_DEFAULT_INTERVAL = _int("TABCHI_DEFAULT_INTERVAL", 1800)
