@@ -440,6 +440,78 @@ def init() -> None:
         )
     """)
 
+    # ---- Telegram multi-account send jobs ---------------------------------- #
+    # Persisted so a restart resumes instead of starting over. Starting over
+    # would message everybody a second time, which is what gets accounts
+    # reported and banned.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS tg_multi_jobs (
+            job_id       TEXT PRIMARY KEY,
+            customer_id  INTEGER NOT NULL,
+            state        TEXT NOT NULL DEFAULT 'queued',
+            content_json TEXT DEFAULT '[]',
+            delay        REAL DEFAULT 0.2,
+            target_mode  TEXT DEFAULT 'both',
+            total        INTEGER DEFAULT 0,
+            mutual_total INTEGER DEFAULT 0,
+            sent_count   INTEGER DEFAULT 0,
+            failed_count INTEGER DEFAULT 0,
+            skipped_count INTEGER DEFAULT 0,
+            current_phone TEXT DEFAULT '',
+            stop_requested INTEGER DEFAULT 0,
+            last_error   TEXT DEFAULT '',
+            msg_id       INTEGER,
+            created_at   TEXT,
+            updated_at   TEXT,
+            finished_at  TEXT DEFAULT ''
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_tgm_jobs "
+              "ON tg_multi_jobs(customer_id, state)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS tg_multi_accounts (
+            job_id       TEXT NOT NULL,
+            customer_id  INTEGER NOT NULL,
+            account_id   INTEGER NOT NULL,
+            phone        TEXT NOT NULL,
+            ordinal      INTEGER DEFAULT 0,
+            state        TEXT DEFAULT 'pending',
+            total        INTEGER DEFAULT 0,
+            sent_count   INTEGER DEFAULT 0,
+            failed_count INTEGER DEFAULT 0,
+            consec_fail  INTEGER DEFAULT 0,
+            last_error   TEXT DEFAULT '',
+            PRIMARY KEY (job_id, account_id)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS tg_multi_recipients (
+            job_id      TEXT NOT NULL,
+            idx         INTEGER NOT NULL,
+            customer_id INTEGER NOT NULL,
+            account_id  INTEGER NOT NULL,
+            target_key  TEXT NOT NULL,
+            target_json TEXT DEFAULT '',
+            mutual      INTEGER DEFAULT 0,
+            state       TEXT DEFAULT 'pending',
+            attempts    INTEGER DEFAULT 0,
+            last_error  TEXT DEFAULT '',
+            PRIMARY KEY (job_id, idx)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_tgm_recip "
+              "ON tg_multi_recipients(job_id, account_id, state, idx)")
+    # Cross-account anti-duplicate WITHIN one job: once any account has reached a
+    # person, a later account in the same job skips them. Without it a customer
+    # with five accounts messages every shared contact five times.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS tg_multi_sent (
+            job_id TEXT NOT NULL,
+            uid    TEXT NOT NULL,
+            PRIMARY KEY (job_id, uid)
+        )
+    """)
+
     # ---- support tickets --------------------------------------------------- #
     # These live in the CUSTOMER database, not the owner's one: a ticket is a
     # message between a customer and the owner, not owner-secret state. Putting
@@ -684,7 +756,8 @@ def delete_customer(telegram_id) -> None:
     for table in ("accounts", "tg_accounts", "customer_settings", "tg_content",
                   "usage_daily", "notifications", "paused_sends", "rb_sent",
                   "tg_sent", "contact_jobs", "tabchi", "tabchi_texts",
-                  "tabchi_groups", "secretary", "secretary_replied", "tickets"):
+                  "tabchi_groups", "secretary", "secretary_replied", "tickets",
+                  "tg_multi_jobs", "tg_multi_accounts", "tg_multi_recipients"):
         c.execute(f"DELETE FROM {table} WHERE customer_id = ?", (cid,))
     c.execute("DELETE FROM rate_limit WHERE customer_id = ?", (cid,))
     c.execute("DELETE FROM customers WHERE telegram_id = ?", (cid,))
@@ -1039,6 +1112,34 @@ def tg_incr_sent(customer_id, account_id, n: int = 1) -> None:
     conn.close()
 
 
+def tg_set_session(customer_id, account_id, session: str) -> None:
+    """Store the (already encrypted) StringSession for a Telegram account."""
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    conn.execute("UPDATE tg_accounts SET session = ? WHERE id = ? AND customer_id = ?",
+                 (session or "", int(account_id), cid))
+    conn.commit()
+    conn.close()
+
+
+def tg_set_stats(customer_id, account_id, **stats) -> None:
+    cid = _require_cid(customer_id)
+    allowed = {"contacts", "mutuals", "groups"}
+    sets, params = [], []
+    for key, value in stats.items():
+        if key in allowed:
+            sets.append(f"{key} = ?")
+            params.append(int(value or 0))
+    if not sets:
+        return
+    params += [int(account_id), cid]
+    conn = _conn()
+    conn.execute(f"UPDATE tg_accounts SET {', '.join(sets)} "
+                 "WHERE id = ? AND customer_id = ?", params)
+    conn.commit()
+    conn.close()
+
+
 def tg_delete_account(customer_id, account_id) -> None:
     cid = _require_cid(customer_id)
     aid = int(account_id)
@@ -1047,6 +1148,8 @@ def tg_delete_account(customer_id, account_id) -> None:
     c.execute("DELETE FROM tg_accounts WHERE id = ? AND customer_id = ?", (aid, cid))
     c.execute("DELETE FROM tg_sent WHERE account_id = ? AND customer_id = ?",
               (aid, cid))
+    c.execute("DELETE FROM tg_multi_accounts WHERE account_id = ? "
+              "AND customer_id = ?", (aid, cid))
     conn.commit()
     conn.close()
 
@@ -2306,5 +2409,254 @@ def owner_answer_ticket(ticket_id, answer: str) -> None:
     conn = _conn()
     conn.execute("UPDATE tickets SET answered = 1, answer = ?, answered_at = ? "
                  "WHERE id = ?", (answer or "", _now(), int(ticket_id)))
+    conn.commit()
+    conn.close()
+
+
+
+# =========================================================================== #
+# Telegram multi-account send jobs
+# =========================================================================== #
+def tgm_create_job(customer_id, content: list, delay: float,
+                   target_mode: str = "both") -> str:
+    cid = _require_cid(customer_id)
+    import uuid
+    job_id = uuid.uuid4().hex[:12]
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO tg_multi_jobs (job_id, customer_id, state, content_json, "
+        "delay, target_mode, created_at, updated_at) "
+        "VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)",
+        (job_id, cid, json.dumps(content or [], ensure_ascii=False),
+         float(delay), target_mode or "both", _now(), _now()))
+    conn.commit()
+    conn.close()
+    return job_id
+
+
+def tgm_get_job(customer_id, job_id) -> dict | None:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    row = _row(conn.execute(
+        "SELECT * FROM tg_multi_jobs WHERE job_id = ? AND customer_id = ?",
+        (str(job_id), cid)))
+    conn.close()
+    if row:
+        try:
+            row["content"] = json.loads(row.get("content_json") or "[]")
+        except (TypeError, ValueError):
+            row["content"] = []
+    return row
+
+
+def tgm_update_job(customer_id, job_id, **fields) -> None:
+    cid = _require_cid(customer_id)
+    allowed = {"state", "total", "mutual_total", "sent_count", "failed_count",
+               "skipped_count", "current_phone", "stop_requested", "last_error",
+               "msg_id", "finished_at"}
+    sets, params = [], []
+    for key, value in fields.items():
+        if key not in allowed:
+            continue
+        sets.append(f"{key} = ?")
+        params.append(value)
+    if not sets:
+        return
+    sets.append("updated_at = ?")
+    params.append(_now())
+    params += [str(job_id), cid]
+    conn = _conn()
+    conn.execute(
+        f"UPDATE tg_multi_jobs SET {', '.join(sets)} "
+        "WHERE job_id = ? AND customer_id = ?", params)
+    conn.commit()
+    conn.close()
+
+
+def tgm_bump_job(customer_id, job_id, *, sent: int = 0, failed: int = 0,
+                 skipped: int = 0) -> None:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    conn.execute(
+        "UPDATE tg_multi_jobs SET sent_count = sent_count + ?, "
+        "failed_count = failed_count + ?, skipped_count = skipped_count + ?, "
+        "updated_at = ? WHERE job_id = ? AND customer_id = ?",
+        (int(sent), int(failed), int(skipped), _now(), str(job_id), cid))
+    conn.commit()
+    conn.close()
+
+
+def tgm_list_jobs(customer_id, limit: int = 10) -> list:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    rows = _rows(conn.execute(
+        "SELECT * FROM tg_multi_jobs WHERE customer_id = ? "
+        "ORDER BY created_at DESC LIMIT ?", (cid, int(limit))))
+    conn.close()
+    return rows
+
+
+def owner_tgm_unfinished() -> list:
+    """Jobs that were still running when the process stopped.
+
+    Read once at boot to resume them and to re-register their accounts in the
+    busy registry.
+    """
+    conn = _conn()
+    rows = _rows(conn.execute(
+        "SELECT * FROM tg_multi_jobs WHERE state IN "
+        "('queued', 'running', 'waiting', 'stop_requested') ORDER BY created_at"))
+    conn.close()
+    for row in rows:
+        try:
+            row["content"] = json.loads(row.get("content_json") or "[]")
+        except (TypeError, ValueError):
+            row["content"] = []
+    return rows
+
+
+def tgm_add_account(customer_id, job_id, account_id, phone: str,
+                    ordinal: int) -> None:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO tg_multi_accounts (job_id, customer_id, "
+        "account_id, phone, ordinal) VALUES (?, ?, ?, ?, ?)",
+        (str(job_id), cid, int(account_id), phone, int(ordinal)))
+    conn.commit()
+    conn.close()
+
+
+def tgm_job_accounts(customer_id, job_id) -> list:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    rows = _rows(conn.execute(
+        "SELECT * FROM tg_multi_accounts WHERE job_id = ? AND customer_id = ? "
+        "ORDER BY ordinal", (str(job_id), cid)))
+    conn.close()
+    return rows
+
+
+def tgm_update_account(customer_id, job_id, account_id, **fields) -> None:
+    cid = _require_cid(customer_id)
+    allowed = {"state", "total", "sent_count", "failed_count", "consec_fail",
+               "last_error"}
+    sets, params = [], []
+    for key, value in fields.items():
+        if key in allowed:
+            sets.append(f"{key} = ?")
+            params.append(value)
+    if not sets:
+        return
+    params += [str(job_id), int(account_id), cid]
+    conn = _conn()
+    conn.execute(
+        f"UPDATE tg_multi_accounts SET {', '.join(sets)} "
+        "WHERE job_id = ? AND account_id = ? AND customer_id = ?", params)
+    conn.commit()
+    conn.close()
+
+
+def tgm_add_recipients(customer_id, job_id, account_id, targets: list,
+                       start_idx: int = 0) -> int:
+    """Queue one account's own recipients. `targets` is [(key, payload, mutual)]."""
+    cid = _require_cid(customer_id)
+    if not targets:
+        return start_idx
+    conn = _conn()
+    c = conn.cursor()
+    idx = start_idx
+    for key, payload, mutual in targets:
+        c.execute(
+            "INSERT OR IGNORE INTO tg_multi_recipients (job_id, idx, customer_id, "
+            "account_id, target_key, target_json, mutual) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (str(job_id), idx, cid, int(account_id), str(key),
+             json.dumps(payload, ensure_ascii=False), 1 if mutual else 0))
+        idx += 1
+    conn.commit()
+    conn.close()
+    return idx
+
+
+def tgm_pending_recipients(customer_id, job_id, account_id,
+                           limit: int = 500) -> list:
+    """The next pending recipients for one account, mutuals first.
+
+    Mutual contacts are people who added the account back, so they are the least
+    likely to report a message — reaching them first makes the account survive
+    longer into the run.
+    """
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    rows = _rows(conn.execute(
+        "SELECT * FROM tg_multi_recipients WHERE job_id = ? AND account_id = ? "
+        "AND customer_id = ? AND state = 'pending' "
+        "ORDER BY mutual DESC, idx LIMIT ?",
+        (str(job_id), int(account_id), cid, int(limit))))
+    conn.close()
+    for row in rows:
+        try:
+            row["target"] = json.loads(row.get("target_json") or "null")
+        except (TypeError, ValueError):
+            row["target"] = None
+    return rows
+
+
+def tgm_set_recipient(customer_id, job_id, idx, state: str,
+                      error: str = "") -> None:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    conn.execute(
+        "UPDATE tg_multi_recipients SET state = ?, attempts = attempts + 1, "
+        "last_error = ? WHERE job_id = ? AND idx = ? AND customer_id = ?",
+        (state, error or "", str(job_id), int(idx), cid))
+    conn.commit()
+    conn.close()
+
+
+def tgm_mark_uid_sent(customer_id, job_id, uid) -> None:
+    _require_cid(customer_id)
+    conn = _conn()
+    conn.execute("INSERT OR IGNORE INTO tg_multi_sent (job_id, uid) VALUES (?, ?)",
+                 (str(job_id), str(uid)))
+    conn.commit()
+    conn.close()
+
+
+def tgm_uid_already_sent(customer_id, job_id, uid) -> bool:
+    """Has anybody in this job already reached this person?
+
+    This is what stops a customer with five accounts from messaging every shared
+    contact five times.
+    """
+    _require_cid(customer_id)
+    conn = _conn()
+    row = _row(conn.execute(
+        "SELECT 1 AS x FROM tg_multi_sent WHERE job_id = ? AND uid = ?",
+        (str(job_id), str(uid))))
+    conn.close()
+    return bool(row)
+
+
+def tgm_counts(customer_id, job_id) -> dict:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    rows = _rows(conn.execute(
+        "SELECT state, COUNT(*) AS n FROM tg_multi_recipients "
+        "WHERE job_id = ? AND customer_id = ? GROUP BY state",
+        (str(job_id), cid)))
+    conn.close()
+    return {r["state"]: int(r["n"]) for r in rows}
+
+
+def tgm_delete_job(customer_id, job_id) -> None:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    c = conn.cursor()
+    for table in ("tg_multi_recipients", "tg_multi_accounts", "tg_multi_jobs"):
+        c.execute(f"DELETE FROM {table} WHERE job_id = ? AND customer_id = ?",
+                  (str(job_id), cid))
+    c.execute("DELETE FROM tg_multi_sent WHERE job_id = ?", (str(job_id),))
     conn.commit()
     conn.close()

@@ -158,29 +158,65 @@ def _install_telethon() -> None:
     tl = types.ModuleType("telethon.tl")
     functions = types.ModuleType("telethon.tl.functions")
     contacts = types.ModuleType("telethon.tl.functions.contacts")
+    messages = types.ModuleType("telethon.tl.functions.messages")
+    channels = types.ModuleType("telethon.tl.functions.channels")
 
     class GetContactsRequest:
         def __init__(self, hash=0):
             self.hash = hash
 
+    class _Request:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
     contacts.GetContactsRequest = GetContactsRequest
+    messages.SetTypingRequest = _Request
+    messages.ImportChatInviteRequest = _Request
+    messages.GetDiscussionMessageRequest = _Request
+    channels.JoinChannelRequest = _Request
+    channels.GetParticipantRequest = _Request
     functions.contacts = contacts
+    functions.messages = messages
+    functions.channels = channels
     tl.functions = functions
 
+    tl_types = types.ModuleType("telethon.tl.types")
+    for name in ("User", "Chat", "Channel", "InputPeerUser", "PeerUser",
+                 "SendMessageTypingAction", "DocumentAttributeFilename"):
+        setattr(tl_types, name, type(name, (), {"__init__":
+                                               lambda self, *a, **k: None}))
+    tl.types = tl_types
+
+    # telethon re-exports these at the top level, and the project imports them
+    # that way (`from telethon import functions, types`).
     telethon.TelegramClient = TelegramClient
     telethon.Button = _Button
     telethon.events = events
     telethon.errors = errors
     telethon.sessions = sessions
     telethon.tl = tl
+    telethon.functions = functions
+    telethon.types = tl_types
+
+    for name in ("SessionPasswordNeededError", "FloodWaitError",
+                 "ChatWriteForbiddenError", "UserNotParticipantError",
+                 "PhoneCodeInvalidError", "AuthKeyUnregisteredError",
+                 "UserDeactivatedBanError", "UserPrivacyRestrictedError",
+                 "PeerIdInvalidError", "MessageIdInvalidError"):
+        if not hasattr(errors, name):
+            setattr(errors, name, type(name, (Exception,), {}))
 
     sys.modules["telethon"] = telethon
     sys.modules["telethon.events"] = events
     sys.modules["telethon.errors"] = errors
     sys.modules["telethon.sessions"] = sessions
     sys.modules["telethon.tl"] = tl
+    sys.modules["telethon.tl.types"] = tl_types
     sys.modules["telethon.tl.functions"] = functions
     sys.modules["telethon.tl.functions.contacts"] = contacts
+    sys.modules["telethon.tl.functions.messages"] = messages
+    sys.modules["telethon.tl.functions.channels"] = channels
 
 
 def _install_httpx() -> None:

@@ -1640,6 +1640,7 @@ def setup(bot, state, gate, safe_edit, respond, register_steps) -> None:
             return _handler
         _make_setting()
 
+    register_pdf_handlers(bot, gate, safe_edit)
     register_steps(_STEPS)
 
 
@@ -2271,3 +2272,446 @@ async def restore_pending() -> None:
             "کارهای نیمه‌کاره دوباره در رجیستری ثبت شدند تا",
             "موتور سلامت روی سشن‌شان اتصال دوم باز نکند.",
         ])
+
+
+
+# --------------------------------------------------------------------------- #
+# PV photo archive -> PDF
+# --------------------------------------------------------------------------- #
+# TWO MODES, AND WHY THE FAST ONE IS SAFE
+# ---------------------------------------
+# "parallel" keeps several downloads in flight over the SAME connection. That is
+# multiplexing, not a second connection — a second connection would revoke the
+# session, which is the bug this whole project is built around avoiding. The
+# bottleneck here is network latency per photo, so overlapping the waits is worth
+# roughly six times the throughput.
+#
+# "safe" downloads strictly one at a time. It is what the base project did.
+#
+# "auto" starts parallel and FALLS BACK to safe after a run of failures, so a
+# platform that rejects the faster pattern degrades instead of failing the export.
+#
+# Delivery is cumulative: a PDF every PV_EXPORT_PDF_BATCH photos, so the customer
+# sees progress. Each photo is prepared exactly once (pdf_export.prepare_image),
+# which is what keeps those repeated rebuilds cheap.
+# --------------------------------------------------------------------------- #
+PDF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "pdf")
+os.makedirs(PDF_DIR, exist_ok=True)
+
+
+def _pdf_mode(customer_id) -> str:
+    mode = (db.get_setting(customer_id, "pv_mode")
+            or config.PV_EXPORT_MODE_DEFAULT)
+    return mode if mode in ("auto", "parallel", "safe") else "auto"
+
+
+def _pdf_parallel(customer_id) -> int:
+    return config.clamp_pv_parallel(
+        db.get_int_setting(customer_id, "pv_parallel", config.PV_EXPORT_PARALLEL))
+
+
+class _PdfDelivery:
+    """Collects prepared JPEGs and ships a cumulative PDF every N photos.
+
+    Holding PREPARED bytes rather than raw photos is the memory difference
+    between roughly 600 MB and 150 MB for a 2000-photo account.
+    """
+
+    def __init__(self, customer_id, phone: str, batch: int):
+        self.customer_id = customer_id
+        self.phone = phone
+        self.batch = max(1, int(batch))
+        self.jpegs: list = []
+        self.files_sent = 0
+        self._next_at = self.batch
+
+    @property
+    def found(self) -> int:
+        return len(self.jpegs)
+
+    async def add(self, jpeg: bytes) -> None:
+        if not jpeg:
+            return
+        self.jpegs.append(jpeg)
+        if self.found >= self._next_at:
+            self._next_at += self.batch
+            await self.flush(final=False)
+
+    async def flush(self, final: bool) -> None:
+        if not self.jpegs:
+            return
+        import pdf_export
+        path = os.path.join(
+            PDF_DIR, f"pv_{self.customer_id}_{self.phone}_{self.found}.pdf")
+        try:
+            pages = await asyncio.to_thread(pdf_export.build_pdf_from_jpegs,
+                                            list(self.jpegs), path)
+            caption = cards.panel_card(
+                "🖼 - #pv_archive" + ("" if final else " (در حال ادامه)"), [
+                    cards.kv("Phone", self.phone),
+                    cards.kv("Photos", cards.num(pages)),
+                    cards.kv("State", "🏁 پایان" if final else "⏳ ادامه دارد"),
+                ])
+            await _bot.send_file(int(self.customer_id), path, caption=caption,
+                                 force_document=True)
+            self.files_sent += 1
+        except Exception as exc:  # noqa: BLE001
+            await logbus.error(exc, context="pdf build", customer=self.customer_id,
+                               notify=False)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+async def _run_pdf(customer_id, acc: dict, msg=None) -> None:
+    """Collect the account's private-chat photos and deliver them as PDFs."""
+    aid, phone = acc["id"], acc["phone"]
+    key = _key(customer_id, phone)
+
+    # A server-side cap, separate from the session registry: this job decodes
+    # images in memory, and a handful started at once exhausts a small VPS.
+    if not busy.take_slot("pdf", config.PV_EXPORT_MAX_CONCURRENT):
+        if msg:
+            try:
+                await msg.edit(cards.card("🖼 آرشیو عکس", [
+                    "الان در دسترس نیست — مشتری دیگری در حال استفاده است.",
+                    "چند دقیقه بعد دوباره امتحان کن.",
+                ]), buttons=[_back(b"rbaccs")])
+            except Exception:
+                pass
+        return
+
+    mode = _pdf_mode(customer_id)
+    parallel = _pdf_parallel(customer_id)
+    delivery = _PdfDelivery(customer_id, phone, config.PV_EXPORT_PDF_BATCH)
+    ctl = {"stop": False, "pause": False, "state": "running", "phone": phone,
+           "mode": mode, "fallback": False, "found": 0,
+           "total": config.PV_EXPORT_MAX_PHOTOS}
+    _jobs[aid] = ctl
+
+    try:
+        async with busy.hold(key, "pdf", customer_id=customer_id,
+                             extra={"account_id": aid}) as held:
+            if not held.ok:
+                if msg:
+                    try:
+                        await msg.edit(cards.card("🖼 آرشیو عکس",
+                                                  [busy.reason(key)]),
+                                       buttons=[_back(b"rbaccs")])
+                    except Exception:
+                        pass
+                return
+
+            await logbus.customer_action(db.get_customer(customer_id),
+                                        "pdf_export_start", [
+                cards.kv("Phone", phone),
+                cards.kv("Mode", mode),
+                cards.kv("Parallel", parallel if mode != "safe" else 1),
+                cards.kv("Batch", config.PV_EXPORT_PDF_BATCH),
+            ], platform="Rubika")
+
+            progress = None
+            if msg is not None:
+                progress = asyncio.create_task(_pdf_progress_loop(aid, ctl, msg,
+                                                                  delivery))
+            try:
+                w = worker.worker_for_account(acc)
+                if w and not worker.is_local(w):
+                    await _pdf_remote(customer_id, acc, w, ctl, delivery, mode,
+                                      parallel)
+                else:
+                    await _pdf_local(customer_id, acc, ctl, delivery, mode,
+                                     parallel)
+                if ctl["state"] == "running":
+                    ctl["state"] = "done"
+            except Exception as exc:  # noqa: BLE001
+                ctl["state"] = "failed"
+                ctl["error"] = await logbus.error(
+                    exc, context=f"pdf export {phone}", customer=customer_id)
+            finally:
+                if progress:
+                    progress.cancel()
+    finally:
+        busy.free_slot("pdf")
+        _jobs.pop(aid, None)
+
+    await delivery.flush(final=True)
+    db.usage_incr(customer_id, "pdf", delivery.found)
+    labels = {"done": "🏁 پایان", "stopped": "⛔ متوقف شد", "failed": "⚠️ خطا"}
+    rows = [
+        cards.kv("Phone", phone),
+        cards.kv("Photos", cards.num(delivery.found)),
+        cards.kv("Files sent", delivery.files_sent),
+        cards.kv("Mode used", "🐢 آرام" if ctl["mode"] == "safe" else "⚡ سریع"),
+    ]
+    if ctl.get("fallback"):
+        rows.append(cards.kv("Note", "حالت سریع به آرام تغییر کرد"))
+    rows.append(cards.kv("Result", labels.get(ctl["state"], ctl["state"])))
+    await logbus.customer_action(db.get_customer(customer_id), "pdf_export_done",
+                                rows, platform="Rubika")
+    text = cards.panel_card("🖼 - #pv_archive_report", rows)
+    if msg is not None:
+        try:
+            await msg.edit(text, buttons=[_back(b"rbaccs")])
+            return
+        except Exception:
+            pass
+    try:
+        await _bot.send_message(int(customer_id), text, buttons=[_back(b"rbaccs")])
+    except Exception:
+        pass
+
+
+async def _pdf_local(customer_id, acc, ctl, delivery, mode, parallel) -> None:
+    """Collect on this machine, over ONE connection."""
+    import account_conn
+    import pdf_export
+    phone = acc["phone"]
+    use_parallel = mode in ("auto", "parallel") and parallel > 1
+
+    async def _collect(client):
+        guids = await rb.get_chat_list_guids(client, only_users=True)
+        consecutive_bad = 0
+        for guid in guids[:config.PV_EXPORT_MAX_CHATS]:
+            if ctl["stop"] or delivery.found >= config.PV_EXPORT_MAX_PHOTOS:
+                return
+            inlines = []
+            async for _mid, file_inline in rb.iter_chat_photos(client, guid):
+                inlines.append(file_inline)
+                if len(inlines) >= 400:
+                    break
+            if not inlines:
+                continue
+
+            if use_parallel and not ctl["fallback"]:
+                semaphore = asyncio.Semaphore(parallel)
+
+                async def _one(file_inline):
+                    async with semaphore:
+                        try:
+                            return await rb.download_photo(client, file_inline)
+                        except Exception:
+                            return None
+
+                step = parallel * 4
+                for start in range(0, len(inlines), step):
+                    if ctl["stop"] or delivery.found >= config.PV_EXPORT_MAX_PHOTOS:
+                        return
+                    chunk = inlines[start:start + step]
+                    blobs = await asyncio.gather(*[_one(fi) for fi in chunk],
+                                                 return_exceptions=True)
+                    bad = 0
+                    for blob in blobs:
+                        if isinstance(blob, Exception) or not blob:
+                            bad += 1
+                            continue
+                        jpeg = await asyncio.to_thread(
+                            pdf_export.prepare_image, blob,
+                            config.PV_EXPORT_PDF_QUALITY,
+                            config.PV_EXPORT_PDF_MAX_EDGE)
+                        await delivery.add(jpeg)
+                        ctl["found"] = delivery.found
+                    consecutive_bad = consecutive_bad + bad if bad else 0
+                    if consecutive_bad >= config.PV_EXPORT_FALLBACK_ERRORS:
+                        # Degrade instead of failing the whole export.
+                        ctl["fallback"] = True
+                        ctl["mode"] = "safe"
+                        consecutive_bad = 0
+                        break
+            else:
+                for file_inline in inlines:
+                    if ctl["stop"] or delivery.found >= config.PV_EXPORT_MAX_PHOTOS:
+                        return
+                    try:
+                        blob = await rb.download_photo(client, file_inline)
+                    except Exception:
+                        continue
+                    jpeg = await asyncio.to_thread(
+                        pdf_export.prepare_image, blob,
+                        config.PV_EXPORT_PDF_QUALITY,
+                        config.PV_EXPORT_PDF_MAX_EDGE)
+                    await delivery.add(jpeg)
+                    ctl["found"] = delivery.found
+
+    await account_conn.call(customer_id, phone, _collect, timeout=3600)
+    if ctl["stop"]:
+        ctl["state"] = "stopped"
+
+
+async def _pdf_remote(customer_id, acc, w, ctl, delivery, mode, parallel) -> None:
+    """Start the collection on the worker and stream batches back by polling.
+
+    Polling instead of one big response: a 2000-photo account returned in a single
+    base64 body is roughly 800 MB through an SSH tunnel, which either times out or
+    exhausts memory.
+    """
+    import base64
+    phone = acc["phone"]
+    started = await worker.api_call(w, "POST", "/pvexport/start", {
+        "customer_id": customer_id, "phone": phone,
+        "max_chats": config.PV_EXPORT_MAX_CHATS,
+        "max_photos": config.PV_EXPORT_MAX_PHOTOS,
+        "mode": mode, "parallel": parallel}, timeout=120)
+    job_id = started.get("job_id")
+    if not job_id:
+        ctl["state"] = "failed"
+        return
+
+    fails = 0
+    while True:
+        await asyncio.sleep(config.PV_EXPORT_POLL_SEC)
+        if ctl["stop"]:
+            try:
+                await worker.api_call(w, "POST", f"/pvexport/stop/{job_id}",
+                                      timeout=30)
+            except Exception:
+                pass
+        try:
+            status = await worker.api_call(
+                w, "GET", f"/pvexport/status/{job_id}?take=40", timeout=120)
+            fails = 0
+        except Exception:
+            fails += 1
+            if fails >= config.PV_EXPORT_MAX_POLL_FAILS:
+                ctl["state"] = "failed"
+                return
+            continue
+
+        for encoded in status.get("batch") or []:
+            try:
+                await delivery.add(base64.b64decode(encoded))
+            except Exception:
+                continue
+        ctl["found"] = delivery.found
+        if status.get("fallback"):
+            ctl["fallback"] = True
+            ctl["mode"] = "safe"
+
+        remote_state = status.get("state")
+        if remote_state != "running" and not status.get("pending"):
+            ctl["state"] = {"done": "running", "stopped": "stopped",
+                            "failed": "failed"}.get(remote_state, remote_state)
+            if ctl["state"] == "running":
+                ctl["state"] = "running"     # let the caller mark it done
+            return
+
+
+async def _pdf_progress_loop(account_id, ctl, msg, delivery) -> None:
+    last = ""
+    try:
+        while True:
+            await asyncio.sleep(config.CONTACT_PROGRESS_EVERY)
+            text = cards.panel_card("🖼 - #pv_archive", [
+                cards.kv("Phone", ctl["phone"]),
+                cards.kv("Photos", cards.num(delivery.found)),
+                cards.kv("Files sent", delivery.files_sent),
+                cards.kv("Mode", "🐢 آرام" if ctl["mode"] == "safe"
+                         else "⚡ سریع"),
+                cards.kv("Next file at", delivery._next_at),   # noqa: SLF001
+            ])
+            if text != last:
+                last = text
+                try:
+                    await msg.edit(text, buttons=[[Button.inline(
+                        "⛔ توقف", f"rbstop_{account_id}".encode())]])
+                except Exception:
+                    pass
+            if ctl.get("state") != "running":
+                return
+    except asyncio.CancelledError:
+        return
+
+
+def register_pdf_handlers(bot, gate, safe_edit) -> None:
+    """PDF screens. Split out so the section menu file stays readable."""
+    from telethon import events
+
+    @bot.on(events.CallbackQuery(data=b"rbpdf"))
+    async def rb_pdf(event):
+        if not await gate(event):
+            return
+        uid = event.sender_id
+        accounts = [a for a in db.list_accounts(uid) if a["status"] == "active"]
+        mode = _pdf_mode(uid)
+        rows = [
+            cards.kv("Mode", {"auto": "⚡ خودکار (سریع با فال‌بک)",
+                              "parallel": "⚡ سریع",
+                              "safe": "🐢 آرام"}[mode]),
+            cards.kv("Every", f"{config.PV_EXPORT_PDF_BATCH} عکس یک فایل"),
+            cards.kv("Max photos", cards.num(config.PV_EXPORT_MAX_PHOTOS)),
+            cards.LINE,
+            "عکس‌های چت‌های خصوصی جمع و به‌صورت PDF فرستاده می‌شوند.",
+            f"هر {config.PV_EXPORT_PDF_BATCH} عکس یک فایل می‌گیری،",
+            "پس لازم نیست تا آخر منتظر بمانی.",
+        ]
+        buttons = [[Button.inline(f"🖼 {a['phone']}",
+                                  f"rbpdfrun_{a['id']}".encode())]
+                   for a in accounts[:config.ACC_PAGE_SIZE]]
+        buttons.append([Button.inline("⚙️ حالت جمع‌آوری", b"rbpdfmode")])
+        buttons.append(_back(b"rb"))
+        if not accounts:
+            rows = ["اکانت فعالی نداری."]
+        await safe_edit(event, cards.card("🖼 آرشیو عکس (PDF)", rows),
+                        buttons=buttons)
+
+    @bot.on(events.CallbackQuery(data=b"rbpdfmode"))
+    async def rb_pdf_mode(event):
+        if not await gate(event):
+            return
+        uid = event.sender_id
+        current = _pdf_mode(uid)
+        rows = [
+            cards.kv("Current", current),
+            cards.LINE,
+            "⚡ سریع — چند دانلود هم‌زمان روی همان یک اتصال.",
+            "   حدود ۶ برابر سریع‌تر. اتصال دوم باز نمی‌شود،",
+            "   پس سشن اکانت در خطر نیست.",
+            "🐢 آرام — یکی‌یکی. کندتر، مطمئن‌تر.",
+            "⚡ خودکار — با سریع شروع می‌کند و اگر به مشکل",
+            "   بخورد خودش آرام می‌شود؛ کار نیمه‌کاره نمی‌ماند.",
+        ]
+        await safe_edit(event, cards.card("⚙️ حالت جمع‌آوری", rows), buttons=[
+            [Button.inline(("✅ " if current == "auto" else "") + "⚡ خودکار",
+                           b"rbpdfset_auto")],
+            [Button.inline(("✅ " if current == "parallel" else "") + "⚡ سریع",
+                           b"rbpdfset_parallel")],
+            [Button.inline(("✅ " if current == "safe" else "") + "🐢 آرام",
+                           b"rbpdfset_safe")],
+            _back(b"rbpdf"),
+        ])
+
+    @bot.on(events.CallbackQuery(pattern=rb"rbpdfset_(auto|parallel|safe)"))
+    async def rb_pdf_mode_set(event):
+        if not await gate(event):
+            return
+        mode = event.pattern_match.group(1).decode()
+        db.set_setting(event.sender_id, "pv_mode", mode)
+        await rb_pdf_mode(event)
+
+    @bot.on(events.CallbackQuery(pattern=rb"rbpdfrun_(\d+)"))
+    async def rb_pdf_run(event):
+        if not await gate(event):
+            return
+        uid = event.sender_id
+        aid = int(event.pattern_match.group(1))
+        acc = db.get_account(uid, aid)
+        if not acc:
+            await event.answer("اکانت پیدا نشد.", alert=True)
+            return
+        key = _key(uid, acc["phone"])
+        if busy.is_busy(key):
+            await _busy_answer(event, key)
+            return
+        if busy.slot_used("pdf") >= config.PV_EXPORT_MAX_CONCURRENT:
+            await event.answer("الان در دسترس نیست — مشتری دیگری در حال "
+                               "استفاده است. چند دقیقه بعد امتحان کن.",
+                               alert=True)
+            return
+        msg = await safe_edit(event, cards.card("🖼 آرشیو عکس", [
+            cards.kv("Phone", acc["phone"]),
+            cards.kv("Mode", _pdf_mode(uid)),
+            "⏳ شروع جمع‌آوری ...",
+        ]))
+        asyncio.create_task(_run_pdf(uid, acc, msg))

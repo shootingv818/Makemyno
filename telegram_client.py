@@ -1,25 +1,30 @@
 """
-telegram_client.py — Telegram userbot layer (Telethon) for YoudonoaAx.
-======================================================================
+telegram_client.py — the Telegram userbot layer (Telethon).
+==========================================================
 
-This is the Telegram counterpart of rubika_client.py. It is fully ADDITIVE:
-it does not import or touch the Rubika side. Each Telegram account is a
-Telethon userbot whose session is stored (encrypted) in the DB as a
-StringSession, so accounts survive restarts and can be moved between servers.
+The Telegram counterpart of rubika_client.py. Each account is a Telethon
+userbot whose session is stored encrypted in the database as a StringSession, so
+accounts survive restarts.
 
-Login uses the SAME API_ID / API_HASH the panel bot already uses
-(config.API_ID / config.API_HASH) — no new credentials are required.
+Login reuses the panel's own API_ID / API_HASH — no extra credentials.
 
-Design mirrors account_conn.py: ONE warm client per account, reused across
-rounds, serialised by a per-account lock, with lazy reconnect. Telegram is
-aggressive about flood limits, so every public call is FloodWait-aware.
+Shape mirrors account_conn.py: ONE warm client per account, reused across rounds,
+serialised by a per-account lock, with lazy reconnect. Telegram is aggressive
+about flood limits, so every public call is FloodWait-aware.
+
+CLIENT IDENTITY IS (customer, phone) — NOT phone
+------------------------------------------------
+Every function takes a customer id. Two customers may own the same number, and
+those are two different sessions; keying the warm-client cache by phone alone
+would hand customer B the live client of customer A — the same socket, and an
+immediate session revocation for whoever connected first.
 """
 from __future__ import annotations
 
 import asyncio
 import re
 
-from telethon import TelegramClient, functions, types
+from telethon import TelegramClient, functions
 from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError,
@@ -36,15 +41,32 @@ import db
 # --------------------------------------------------------------------------- #
 # Warm client registry (one persistent client per account, like account_conn).
 # --------------------------------------------------------------------------- #
-_clients: dict = {}        # phone -> TelegramClient (connected, authorized)
-_locks: dict = {}          # phone -> asyncio.Lock
+_clients: dict = {}        # "cid:phone" -> TelegramClient (connected, authorized)
+_locks: dict = {}          # "cid:phone" -> asyncio.Lock
 
 
-def _lock(phone: str) -> asyncio.Lock:
-    lk = _locks.get(phone)
+def _cid(customer_id) -> int:
+    try:
+        cid = int(customer_id)
+    except (TypeError, ValueError):
+        cid = 0
+    if not cid:
+        raise ValueError("telegram_client requires a customer id "
+                         "(two customers may own the same phone number)")
+    return cid
+
+
+def _key(customer_id, phone: str) -> str:
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    return f"{_cid(customer_id)}:{digits}"
+
+
+def _lock(customer_id, phone: str) -> asyncio.Lock:
+    key = _key(customer_id, phone)
+    lk = _locks.get(key)
     if lk is None:
         lk = asyncio.Lock()
-        _locks[phone] = lk
+        _locks[key] = lk
     return lk
 
 
@@ -53,50 +75,80 @@ def _new_client(session_str: str = "") -> TelegramClient:
                           config.API_ID, config.API_HASH)
 
 
-async def _save_session(phone: str, client: TelegramClient):
-    """Persist the (encrypted) StringSession for an account."""
+async def save_session(customer_id, account_id, client: TelegramClient):
+    """Persist the encrypted StringSession for an account."""
     try:
-        s = client.session.save()
-        db.tg_set_session(phone, crypto_util.encrypt(s))
+        raw = client.session.save()
+        db.tg_set_session(customer_id, account_id, crypto_util.encrypt(raw))
     except Exception:
         pass
 
 
-async def get_client(phone: str) -> TelegramClient:
-    """Return a connected+authorized warm client for the account, opening it
-    lazily from the stored session. Raises if the account has no usable
-    session (needs re-login)."""
-    c = _clients.get(phone)
-    if c is not None and c.is_connected():
-        return c
-    acc = db.tg_get_account(phone)
-    if not acc or not acc.get("session"):
+async def get_client(customer_id, account_id) -> TelegramClient:
+    """A connected, authorised warm client for one account.
+
+    Opened lazily from the stored session. Raises when the account has no usable
+    session, which the caller turns into "log in again" rather than a crash.
+    """
+    acc = db.tg_get_account(customer_id, account_id)
+    if not acc:
+        raise RuntimeError("no_account")
+    key = _key(customer_id, acc["phone"])
+    existing = _clients.get(key)
+    if existing is not None and existing.is_connected():
+        return existing
+    if not acc.get("session"):
         raise RuntimeError("no_session")
-    session_str = crypto_util.decrypt(acc["session"])
-    c = _new_client(session_str)
-    await c.connect()
-    if not await c.is_user_authorized():
+    try:
+        session_str = crypto_util.decrypt(acc["session"])
+    except Exception:
+        session_str = acc["session"]
+    client = _new_client(session_str)
+    await client.connect()
+    if not await client.is_user_authorized():
         try:
-            await c.disconnect()
+            await client.disconnect()
         except Exception:
             pass
         raise RuntimeError("unauthorized")
-    _clients[phone] = c
-    return c
+    _clients[key] = client
+    return client
 
 
-async def drop_client(phone: str):
-    c = _clients.pop(phone, None)
-    if c is not None:
+async def drop_client(customer_id, phone: str):
+    client = _clients.pop(_key(customer_id, phone), None)
+    if client is not None:
         try:
-            await c.disconnect()
+            await client.disconnect()
         except Exception:
             pass
 
 
+async def close_customer(customer_id):
+    """Close every warm client belonging to one customer."""
+    prefix = f"{_cid(customer_id)}:"
+    for key in [k for k in _clients if k.startswith(prefix)]:
+        client = _clients.pop(key, None)
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
 async def close_all():
-    for phone in list(_clients.keys()):
-        await drop_client(phone)
+    for key in list(_clients.keys()):
+        client = _clients.pop(key, None)
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
+def open_count() -> int:
+    """How many warm Telegram clients are held (owner diagnostics)."""
+    return sum(1 for c in _clients.values() if c is not None)
 
 
 # --------------------------------------------------------------------------- #
@@ -145,17 +197,23 @@ async def finish_password(ctx: dict, password: str) -> dict:
     return ctx
 
 
-async def commit_login(ctx: dict) -> dict:
-    """After a successful sign-in: read account info, persist the session, and
-    register the warm client. Returns {phone, name, username, user_id,
-    contacts}."""
+async def commit_login(customer_id, ctx: dict) -> dict:
+    """Finish a login: read the account info, persist the encrypted session under
+    this customer, and keep the client warm. Returns the info dict plus the new
+    account id."""
     client = ctx["client"]
     phone = ctx["phone"]
     info = await account_info(client)
-    db.tg_upsert_account(phone, info.get("name", ""), info.get("username", ""),
-                         info.get("user_id"), info.get("contacts", 0),
-                         crypto_util.encrypt(client.session.save()))
-    _clients[phone] = client
+    account_id = db.tg_add_account(
+        customer_id, phone,
+        name=info.get("name", ""), username=info.get("username", ""),
+        session=crypto_util.encrypt(client.session.save()),
+        contacts=info.get("contacts", 0),
+        mutuals=info.get("mutuals", 0),
+        groups=info.get("groups", 0),
+    )
+    _clients[_key(customer_id, phone)] = client
+    info["account_id"] = account_id
     return info
 
 
