@@ -132,6 +132,19 @@ def test_the_restart_rate_limit_is_in_the_unit_section():
         assert key not in service, f"{key} under [Service] is silently ignored"
 
 
+def test_the_unit_disables_bytecode_caching():
+    """On this fleet a git reset did not reliably invalidate .pyc, so stale
+    bytecode kept running fixed source. No cache, no ghost."""
+    service = "\n".join(_sections(_unit())["Service"])
+    assert "PYTHONDONTWRITEBYTECODE=1" in service
+
+
+def test_update_clears_the_bytecode_cache():
+    with open(os.path.join(ROOT, "deploy", "makemyno.sh"), encoding="utf-8") as fh:
+        body = fh.read()
+    assert "__pycache__" in body, "update must clear stale bytecode after a pull"
+
+
 def test_the_unit_sets_the_things_that_keep_it_alive():
     service = "\n".join(_sections(_unit())["Service"])
     assert "Restart=always" in service, "a bot that dies at 3am must come back"

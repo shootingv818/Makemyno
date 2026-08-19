@@ -20,6 +20,12 @@ Type=simple
 WorkingDirectory={{APP_DIR}}
 EnvironmentFile={{APP_DIR}}/.env
 Environment=PYTHONUNBUFFERED=1
+# Never write .pyc on bare metal. On this fleet a `git reset --hard` did not
+# reliably invalidate cached bytecode — a fixed .py sat next to a stale .pyc and
+# the old code kept running (twice: db.add_account, then the Telegram unpack).
+# No bytecode cache, no staleness. The tiny startup cost is worth never chasing
+# that ghost again.
+Environment=PYTHONDONTWRITEBYTECODE=1
 
 # The role is an ARGUMENT, not an environment variable.
 #

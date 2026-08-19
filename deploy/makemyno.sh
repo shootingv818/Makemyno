@@ -80,6 +80,13 @@ update)
     ./.venv/bin/pip install --quiet -r requirements.txt
     ok "کتابخانه‌ها بررسی شد"
 
+    # Clear cached bytecode. On this fleet a `git reset --hard` did not reliably
+    # invalidate .pyc files, so a fixed .py ran next to stale bytecode and the old
+    # code kept executing. Deleting the cache makes the pull actually take effect.
+    find "$APP_DIR" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+    find "$APP_DIR" -name '*.pyc' -delete 2>/dev/null || true
+    ok "کش bytecode پاک شد"
+
     # Check the new code loads BEFORE restarting into it. A syntax error found
     # here is a five-second annoyance; found by systemd it is a flapping service.
     if ! MODE=owner ./.venv/bin/python -c 'import config, owner_bot, customer_bot' 2>/dev/null; then
