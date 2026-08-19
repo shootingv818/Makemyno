@@ -28,6 +28,7 @@ failure to log must not break a send.
 from __future__ import annotations
 
 import asyncio
+import os
 import traceback
 import uuid
 
@@ -181,6 +182,19 @@ async def error(exc: BaseException = None, *, context: str = "",
             detail.append(cards.kv("Message", message[:300]))
     detail.extend(rows or [])
     if exc is not None:
+        # The forensics are a convenience. If inspecting a frame goes wrong, the
+        # REPORT must still go out: losing the error card is far worse than losing
+        # the local variables.
+        try:
+            frame = _blame(exc)
+        except Exception:      # noqa: BLE001
+            frame = None
+        if frame:
+            detail.append(cards.LINE)
+            detail.append(cards.kv("File", frame["where"]))
+            detail.append(cards.kv("Line", frame["code"]))
+            for name, value in frame["locals"]:
+                detail.append(f"   {name} = {value}")
         tb = "".join(traceback.format_exception(type(exc), exc,
                                                 exc.__traceback__))[-1200:]
         detail.append(cards.LINE)
@@ -196,6 +210,83 @@ async def error(exc: BaseException = None, *, context: str = "",
         ])
         await to_pv(cid, text)
     return code
+
+
+# Anything whose NAME looks like a credential is redacted: this card goes to the
+# log group, and a traceback is not a reason to print an auth token there.
+_SECRET_HINTS = ("auth", "key", "token", "pass", "secret", "session", "private")
+
+
+def _blame(exc: BaseException) -> dict | None:
+    """The deepest frame in OUR code, with its local variables.
+
+    WHY THIS EXISTS
+    ---------------
+    A production login failed with "'NoneType' object is not callable" pointing at
+
+        aid = db.add_account(uid, phone, name=info.get("name") or "",
+
+    Three callables live in that one statement, so the traceback named the wrong
+    suspect: `db.add_account` was fine and `info.get` was the None. It cost three
+    rounds of debugging, and printing the locals would have ended it in one —
+    `info` would have shown up as a rubpy object instead of a dict.
+
+    Only OUR frames are inspected: a traceback through telethon or rubpy has
+    locals that are enormous and none of our business. Values are truncated, and
+    anything that looks like a credential is redacted, because this card goes to
+    the log group.
+    """
+    tb = getattr(exc, "__traceback__", None)
+    if tb is None:
+        return None
+    root = os.path.dirname(os.path.abspath(__file__))
+    chosen = None
+    while tb is not None:
+        path = os.path.abspath(tb.tb_frame.f_code.co_filename)
+        # Anywhere under the project root, including subdirectories, but never a
+        # dependency that happens to live inside the virtualenv beneath it.
+        inside = path == root or path.startswith(root + os.sep)
+        vendored = "site-packages" in path or f"{os.sep}.venv{os.sep}" in path
+        if inside and not vendored:
+            chosen = tb
+        tb = tb.tb_next
+    if chosen is None:
+        return None
+
+    frame = chosen.tb_frame
+    lineno = chosen.tb_lineno
+    source = ""
+    try:
+        import linecache
+        source = (linecache.getline(frame.f_code.co_filename, lineno) or "").strip()
+    except Exception:      # noqa: BLE001
+        pass
+
+    shown = []
+    for name, value in list(frame.f_locals.items()):
+        if name.startswith("__"):
+            continue
+        if any(hint in name.lower() for hint in _SECRET_HINTS):
+            shown.append((name, "<redacted>"))
+            continue
+        try:
+            text = repr(value)
+        except Exception:  # noqa: BLE001 - a broken __repr__ must not hide the bug
+            text = f"<unreprable {type(value).__name__}>"
+        if len(text) > 160:
+            text = text[:160] + "…"
+        # The type matters as much as the value: "a dict or a rubpy object?" was
+        # the entire question in the bug that motivated this.
+        shown.append((name, f"({type(value).__name__}) {text}"))
+        if len(shown) >= 12:
+            break
+
+    return {
+        "where": f"{os.path.basename(frame.f_code.co_filename)}:{lineno}"
+                 f" in {frame.f_code.co_name}",
+        "code": source[:160] or "—",
+        "locals": shown,
+    }
 
 
 async def warn(title: str, rows: list) -> None:

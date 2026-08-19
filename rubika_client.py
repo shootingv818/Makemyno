@@ -206,7 +206,36 @@ async def finish_login(ctx: dict, code: str):
         except Exception:
             pass
 
-    return result
+    # Return a NORMALISED DICT, never the raw rubpy object.
+    #
+    # This used to `return result`, and every caller treated it as a dict:
+    # rubika_panel does `info.get("name")` and worker_api does `{**(info or {})}`.
+    # The rubpy response object carries a field literally named `get` whose value
+    # is None, so `info.get("name")` evaluated to `None("name")` and every single
+    # Rubika login died with "'NoneType' object is not callable" — pointing at the
+    # db.add_account line, which sent three rounds of debugging after the wrong
+    # suspect. The shape the callers want is the shape this returns.
+    guid = _guid_of(_get(result, "user")) or _guid_of(result) or ""
+    user = _get(result, "user")
+    name = _name_of(user, "") or ""
+    phone_out = _get(user, "phone") or phone
+    return {
+        "guid": guid,
+        "name": name,
+        "phone": phone_out,
+        # The five portable values, so the account can be restored later from a
+        # session token without another SMS code.
+        "session_values": {
+            "auth": client.auth,
+            "key": getattr(client, "key", None),
+            "private_key": private_key,
+            "guid": guid,
+            "user_agent": getattr(client, "user_agent", None),
+            "phone": phone_out,
+            "name": name,
+        },
+        "raw_status": str(status or "OK"),
+    }
 
 
 # --------------------------------------------------------------------------- #
