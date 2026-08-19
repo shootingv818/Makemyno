@@ -10,7 +10,10 @@ able to read:
   * broadcasts   — a record of every broadcast the owner sent
   * audit_log    — every privileged action (grant time, block, broadcast,
                    add/remove worker, backup, freeze sends, shield on/off)
-  * tickets      — support messages relayed from customers, with the reply
+
+Support tickets deliberately do NOT live here: a ticket is a message between a
+customer and the owner, and the customer bot has to be able to file one. They sit
+in the customer database instead (db.add_ticket / db.owner_list_tickets).
 
 THE CUSTOMER PROCESS NEVER IMPORTS THIS MODULE. That is the isolation: not a
 permission check that can be forgotten, but a file the other process does not
@@ -83,17 +86,6 @@ def init() -> None:
             action     TEXT,
             detail     TEXT,
             created_at TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS tickets (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            customer_id INTEGER,
-            text        TEXT,
-            answered    INTEGER DEFAULT 0,
-            answer      TEXT DEFAULT '',
-            created_at  TEXT,
-            answered_at TEXT DEFAULT ''
         )
     """)
     conn.commit()
@@ -209,50 +201,3 @@ def list_audit(limit: int = 50) -> list:
         "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (int(limit),)))
     conn.close()
     return rows
-
-
-# --------------------------------------------------------------------------- #
-# Support tickets (customer -> owner, with the reply relayed back)
-# --------------------------------------------------------------------------- #
-def add_ticket(customer_id: int, text: str) -> int:
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("INSERT INTO tickets (customer_id, text, created_at) "
-              "VALUES (?, ?, ?)", (int(customer_id), text or "", _now()))
-    conn.commit()
-    tid = c.lastrowid
-    conn.close()
-    return int(tid)
-
-
-def get_ticket(ticket_id) -> dict | None:
-    conn = _conn()
-    row = _row(conn.execute("SELECT * FROM tickets WHERE id = ?", (int(ticket_id),)))
-    conn.close()
-    return row
-
-
-def answer_ticket(ticket_id, answer: str) -> None:
-    conn = _conn()
-    conn.execute("UPDATE tickets SET answered = 1, answer = ?, answered_at = ? "
-                 "WHERE id = ?", (answer or "", _now(), int(ticket_id)))
-    conn.commit()
-    conn.close()
-
-
-def list_tickets(only_open: bool = True, limit: int = 30) -> list:
-    sql = "SELECT * FROM tickets"
-    if only_open:
-        sql += " WHERE answered = 0"
-    sql += " ORDER BY id DESC LIMIT ?"
-    conn = _conn()
-    rows = _rows(conn.execute(sql, (int(limit),)))
-    conn.close()
-    return rows
-
-
-def count_open_tickets() -> int:
-    conn = _conn()
-    row = _row(conn.execute("SELECT COUNT(*) AS n FROM tickets WHERE answered = 0"))
-    conn.close()
-    return int(row["n"]) if row else 0

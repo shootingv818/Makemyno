@@ -100,7 +100,7 @@ def main_menu() -> list:
     ]
     open_tickets = 0
     try:
-        open_tickets = central_db.count_open_tickets()
+        open_tickets = db.owner_count_open_tickets()
     except Exception:
         pass
     label = "📨 تیکت‌ها" + (f" ({open_tickets})" if open_tickets else "")
@@ -1362,7 +1362,7 @@ async def _diagnose(phone: str) -> str:
 async def tickets_cb(event):
     if not is_owner(event):
         return
-    open_tickets = central_db.list_tickets(only_open=True, limit=20)
+    open_tickets = db.owner_list_tickets(only_open=True, limit=20)
     if not open_tickets:
         await safe_edit(event, cards.card("📨 - #tickets", ["تیکت بازی نیست. 👌"]),
                         buttons=[[Button.inline("📋 آرشیو", b"tk_all")],
@@ -1386,7 +1386,7 @@ async def ticket_detail_cb(event):
     if not is_owner(event):
         return
     tid = int(event.pattern_match.group(1))
-    ticket = central_db.get_ticket(tid)
+    ticket = db.owner_get_ticket(tid)
     if not ticket:
         await event.answer("تیکت پیدا نشد.", alert=True)
         return
@@ -1432,7 +1432,7 @@ async def tickets_all_cb(event):
     if not is_owner(event):
         return
     rows = []
-    for ticket in central_db.list_tickets(only_open=False, limit=20):
+    for ticket in db.owner_list_tickets(only_open=False, limit=20):
         mark = "✅" if ticket.get("answered") else "📨"
         rows.append(f"{mark} #{ticket['id']} · {ticket['customer_id']} · "
                     f"{(ticket.get('created_at') or '')[:10]}")
@@ -1683,11 +1683,11 @@ async def _step_ticket_reply(event, st):
     tid = st["tid"]
     state.pop(event.sender_id, None)
     text = (event.raw_text or "").strip()
-    ticket = central_db.get_ticket(tid)
+    ticket = db.owner_get_ticket(tid)
     if not ticket or not text:
         await event.respond("تیکت یا متن نامعتبر بود.", buttons=[_back(b"tickets")])
         return
-    central_db.answer_ticket(tid, text)
+    db.owner_answer_ticket(tid, text)
     db.queue_notification(ticket["customer_id"], cards.card("💬 پاسخ پشتیبانی", [
         cards.kv("درباره", f"«{(ticket.get('text') or '')[:60]}»", width=8),
         cards.LINE,

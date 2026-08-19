@@ -387,3 +387,74 @@ def test_the_query_check_would_catch_an_unscoped_read():
     leaky = "conn.execute('SELECT * FROM accounts ORDER BY id')"
     assert table_re.search(leaky)
     assert "customer_id" not in leaky
+
+
+# --------------------------------------------------------------------------- #
+# Every customer-facing screen must pass through the access gate
+# --------------------------------------------------------------------------- #
+def _handler_functions(src: str, module: str) -> list:
+    """Async functions decorated with a CallbackQuery or NewMessage handler."""
+    tree = ast.parse(src, filename=module)
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        for deco in node.decorator_list:
+            text = ast.dump(deco)
+            if "CallbackQuery" in text or "NewMessage" in text:
+                found.append(node)
+                break
+    return found
+
+
+def test_every_customer_screen_checks_the_gate():
+    """A new screen that forgets the gate would serve a blocked, expired or
+    flooding customer. Rather than trusting review, the rule is checked here.
+
+    The gate is the one place that walks shield -> maintenance -> blocked ->
+    rate limit -> subscription, so 'did you call it' is the whole question.
+    """
+    # /start does its own shield handling before a customer row even exists, and
+    # the shared text router runs the gate itself before dispatching a step.
+    exempt = {"start_handler", "text_router"}
+    offenders = []
+    for module in ("customer_bot.py", "rubika_panel.py", "tg_panel.py",
+                   "tabchi.py"):
+        src = _source(module)
+        if src is None:
+            continue
+        for fn in _handler_functions(src, module):
+            if fn.name in exempt:
+                continue
+            body = ast.dump(fn)
+            if "_gate" not in body and "gate" not in body:
+                offenders.append(f"{module}:{fn.name}")
+    assert offenders == [], (
+        f"these customer-facing handlers skip the access gate: {offenders}")
+
+
+def test_the_gate_check_would_catch_a_missing_call():
+    """Prove that check has teeth."""
+    leaky = ast.parse(
+        "@bot.on(events.CallbackQuery(data=b'x'))\n"
+        "async def open_screen(event):\n"
+        "    await safe_edit(event, 'secret')\n"
+    )
+    fn = leaky.body[0]
+    assert isinstance(fn, ast.AsyncFunctionDef)
+    assert "gate" not in ast.dump(fn)
+
+
+def test_customer_panels_do_not_reach_owner_only_helpers():
+    """No customer screen may call the fleet's provisioning or credential code,
+    or the backup builder."""
+    forbidden = ("provision_worker", "register_provisioned", "teardown_worker",
+                 "update_worker", "collect_worker_sessions", "run_backup",
+                 "build_archive", "decrypt")
+    for module in ("customer_bot.py", "rubika_panel.py", "tg_panel.py",
+                   "tabchi.py"):
+        src = _source(module)
+        if src is None:
+            continue
+        for name in forbidden:
+            assert name not in src, f"{module} references owner-only {name}"

@@ -305,12 +305,35 @@ def test_broadcast_history():
 
 
 def test_tickets_open_then_answered(alice):
-    tid = central_db.add_ticket(alice, "my accounts stopped working")
-    assert central_db.count_open_tickets() == 1
-    central_db.answer_ticket(tid, "checked, please re-login")
-    assert central_db.count_open_tickets() == 0
-    ticket = central_db.get_ticket(tid)
+    """Tickets live in the CUSTOMER database, because the customer bot has to be
+    able to file one and that process cannot open the owner's database."""
+    tid = db.add_ticket(alice, "my accounts stopped working")
+    assert db.owner_count_open_tickets() == 1
+    db.owner_answer_ticket(tid, "checked, please re-login")
+    assert db.owner_count_open_tickets() == 0
+    ticket = db.owner_get_ticket(tid)
     assert ticket["answered"] == 1 and ticket["answer"].startswith("checked")
+
+
+def test_tickets_are_scoped_when_a_customer_reads_them(alice, bob):
+    db.add_ticket(alice, "alice problem")
+    db.add_ticket(bob, "bob problem")
+    assert [t["text"] for t in db.customer_tickets(alice)] == ["alice problem"]
+    assert [t["text"] for t in db.customer_tickets(bob)] == ["bob problem"]
+
+
+def test_open_ticket_count_is_per_customer(alice, bob):
+    db.add_ticket(alice, "one")
+    db.add_ticket(alice, "two")
+    db.add_ticket(bob, "three")
+    assert db.customer_open_tickets(alice) == 2
+    assert db.customer_open_tickets(bob) == 1
+
+
+def test_deleting_a_customer_removes_their_tickets(alice):
+    db.add_ticket(alice, "help")
+    db.delete_customer(alice)
+    assert db.owner_count_open_tickets() == 0
 
 
 def test_backup_bookkeeping():

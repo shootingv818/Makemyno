@@ -440,6 +440,25 @@ def init() -> None:
         )
     """)
 
+    # ---- support tickets --------------------------------------------------- #
+    # These live in the CUSTOMER database, not the owner's one: a ticket is a
+    # message between a customer and the owner, not owner-secret state. Putting
+    # them here is what lets the customer bot file one at all — that process
+    # deliberately cannot open central_db.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS tickets (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            text        TEXT,
+            answered    INTEGER DEFAULT 0,
+            answer      TEXT DEFAULT '',
+            created_at  TEXT,
+            answered_at TEXT DEFAULT ''
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_tickets_open "
+              "ON tickets(answered, id)")
+
     conn.commit()
     conn.close()
 
@@ -665,7 +684,7 @@ def delete_customer(telegram_id) -> None:
     for table in ("accounts", "tg_accounts", "customer_settings", "tg_content",
                   "usage_daily", "notifications", "paused_sends", "rb_sent",
                   "tg_sent", "contact_jobs", "tabchi", "tabchi_texts",
-                  "tabchi_groups", "secretary", "secretary_replied"):
+                  "tabchi_groups", "secretary", "secretary_replied", "tickets"):
         c.execute(f"DELETE FROM {table} WHERE customer_id = ?", (cid,))
     c.execute("DELETE FROM rate_limit WHERE customer_id = ?", (cid,))
     c.execute("DELETE FROM customers WHERE telegram_id = ?", (cid,))
@@ -2213,3 +2232,79 @@ def owner_locate_phone(phone: str) -> list:
             out.append(row)
     conn.close()
     return out
+
+
+
+# =========================================================================== #
+# Support tickets
+# =========================================================================== #
+def add_ticket(customer_id, text: str) -> int:
+    """File a support ticket. Written by the customer bot."""
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("INSERT INTO tickets (customer_id, text, created_at) "
+              "VALUES (?, ?, ?)", (cid, (text or "").strip(), _now()))
+    conn.commit()
+    tid = c.lastrowid
+    conn.close()
+    return int(tid)
+
+
+def customer_tickets(customer_id, limit: int = 10) -> list:
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    rows = _rows(conn.execute(
+        "SELECT * FROM tickets WHERE customer_id = ? ORDER BY id DESC LIMIT ?",
+        (cid, int(limit))))
+    conn.close()
+    return rows
+
+
+def customer_open_tickets(customer_id) -> int:
+    """How many unanswered tickets this customer already has.
+
+    The panel uses it to refuse a second one: an open ticket queue of fifty
+    duplicates from the same person is not more information, just more noise.
+    """
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    row = _row(conn.execute(
+        "SELECT COUNT(*) AS n FROM tickets WHERE customer_id = ? AND answered = 0",
+        (cid,)))
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+def owner_get_ticket(ticket_id) -> dict | None:
+    conn = _conn()
+    row = _row(conn.execute("SELECT * FROM tickets WHERE id = ?",
+                            (int(ticket_id),)))
+    conn.close()
+    return row
+
+
+def owner_list_tickets(only_open: bool = True, limit: int = 30) -> list:
+    sql = "SELECT * FROM tickets"
+    if only_open:
+        sql += " WHERE answered = 0"
+    sql += " ORDER BY id DESC LIMIT ?"
+    conn = _conn()
+    rows = _rows(conn.execute(sql, (int(limit),)))
+    conn.close()
+    return rows
+
+
+def owner_count_open_tickets() -> int:
+    conn = _conn()
+    row = _row(conn.execute("SELECT COUNT(*) AS n FROM tickets WHERE answered = 0"))
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+def owner_answer_ticket(ticket_id, answer: str) -> None:
+    conn = _conn()
+    conn.execute("UPDATE tickets SET answered = 1, answer = ?, answered_at = ? "
+                 "WHERE id = ?", (answer or "", _now(), int(ticket_id)))
+    conn.commit()
+    conn.close()

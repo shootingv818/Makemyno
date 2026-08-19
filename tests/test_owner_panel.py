@@ -85,7 +85,7 @@ def test_dashboard_survives_an_empty_service():
 
 def test_main_menu_flags_open_tickets(alice):
     plain = owner_bot.main_menu()
-    central_db.add_ticket(alice, "help")
+    db.add_ticket(alice, "help")
     with_ticket = owner_bot.main_menu()
     flat_before = [b for row in plain for b in row]
     flat_after = [b for row in with_ticket for b in row]
@@ -373,7 +373,7 @@ def test_diagnose_finds_both_platforms(alice):
 # Tickets
 # --------------------------------------------------------------------------- #
 def test_ticket_reply_answers_and_notifies(alice):
-    tid = central_db.add_ticket(alice, "اکانتم کار نمی‌کند")
+    tid = db.add_ticket(alice, "اکانتم کار نمی‌کند")
 
     class _Ev:
         sender_id = 1
@@ -383,11 +383,11 @@ def test_ticket_reply_answers_and_notifies(alice):
 
     asyncio.run(owner_bot._step_ticket_reply(_Ev(), {"tid": tid}))
 
-    assert central_db.get_ticket(tid)["answered"] == 1
+    assert db.owner_get_ticket(tid)["answered"] == 1
     queued = db.fetch_unsent_notifications()
     assert len(queued) == 1
     assert "دوباره لاگین" in queued[0]["text"]
-    assert central_db.count_open_tickets() == 0
+    assert db.owner_count_open_tickets() == 0
 
 
 def test_ticket_reply_on_a_missing_ticket_is_safe():
