@@ -12,10 +12,14 @@ import types
 
 import pytest
 
+import os
+
 import cards
 import config
 import db
 import telegram_multi_send as multi
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 # --------------------------------------------------------------------------- #
@@ -76,68 +80,122 @@ class _FakeMsg:
         self.edits.append(text)
 
 
-def test_the_live_loop_edits_until_the_job_is_terminal(monkeypatch, alice):
-    import tg_panel
+def test_the_progress_card_moves_while_an_account_is_still_sending(alice):
+    """THE BUG THE CUSTOMER SAW. The card read job["sent_count"], a column that
+    _run_account only writes when it FINISHES an account — so a job sending to
+    hundreds of people displayed 0/N the whole time and looked frozen. The
+    recipients table is updated per message, so it is the only live source."""
+    job_id = db.tgm_create_job(alice, [{"kind": "text", "text": "hi"}], 0.2, "both")
+    aid = db.add_tg_account(alice, "09120000001") if hasattr(db, "add_tg_account") \
+        else None
+    account_id = aid or 1
+    db.tgm_add_account(alice, job_id, account_id, "09120000001", 3)
+    db.tgm_add_recipients(alice, job_id, account_id, [
+        ("u1", {"kind": "user", "id": 1}, True),
+        ("u2", {"kind": "user", "id": 2}, False),
+        ("u3", {"kind": "user", "id": 3}, False)])
+    db.tgm_update_job(alice, job_id, total=3)
 
-    # A job that is running for two polls, then done.
-    states = iter([
-        {"state": "running", "sent_count": 1},
-        {"state": "running", "sent_count": 2},
-        {"state": "done", "sent_count": 3},
-    ])
-    cards_seq = iter(["card-1", "card-2", "card-3"])
+    assert "0/3" in multi.progress_card(alice, job_id)
 
-    monkeypatch.setattr(multi, "status", lambda c, j: next(states))
-    monkeypatch.setattr(multi, "progress_card", lambda c, j: next(cards_seq))
-    monkeypatch.setattr(tg_panel.config, "TG_STATS_REFRESH", 0.0)
+    # Two delivered. The job row is deliberately NOT bumped — that only happens
+    # when the account finishes, which is exactly the situation being tested.
+    db.tgm_set_recipient(alice, job_id, 0, "sent")
+    db.tgm_set_recipient(alice, job_id, 1, "sent")
 
-    msg = _FakeMsg()
-    asyncio.run(tg_panel._multi_progress_loop(alice, "job1", msg))
-    # It kept editing while running and stopped once the job was done.
-    assert msg.edits == ["card-1", "card-2", "card-3"]
-
-
-def test_the_live_loop_stops_when_the_job_vanishes(monkeypatch, alice):
-    import tg_panel
-    monkeypatch.setattr(multi, "status", lambda c, j: None)
-    monkeypatch.setattr(tg_panel.config, "TG_STATS_REFRESH", 0.0)
-    msg = _FakeMsg()
-    asyncio.run(tg_panel._multi_progress_loop(alice, "gone", msg))
-    assert msg.edits == []
-
-
-def test_a_failed_edit_does_not_kill_the_loop(monkeypatch, alice):
-    """A customer who scrolled away makes the edit fail; the job must keep being
-    tracked to its terminal state anyway."""
-    import tg_panel
-    states = iter([{"state": "running"}, {"state": "done"}])
-    monkeypatch.setattr(multi, "status", lambda c, j: next(states))
-    monkeypatch.setattr(multi, "progress_card",
-                        lambda c, j: f"card-{id(object())}")
-    monkeypatch.setattr(tg_panel.config, "TG_STATS_REFRESH", 0.0)
-
-    class _BadMsg:
-        id = 1
-        async def edit(self, *a, **k):
-            raise RuntimeError("message not found")
-
-    # Must not raise.
-    asyncio.run(tg_panel._multi_progress_loop(alice, "job", _BadMsg()))
+    card = multi.progress_card(alice, job_id)
+    assert "2/3" in card, "the card did not move while the account was mid-run"
+    assert db.tgm_get_job(alice, job_id)["sent_count"] == 0, (
+        "the stale column is still zero — proving the card no longer reads it")
 
 
-def test_the_loop_does_not_spin_forever_without_delay(monkeypatch, alice):
-    """Safety: a status that never turns terminal must still be bounded by the
-    poll sleep, not become a busy-loop. We assert it honours the sleep call."""
-    import tg_panel
-    monkeypatch.setattr(multi, "status", lambda c, j: {"state": "done"})
-    monkeypatch.setattr(multi, "progress_card", lambda c, j: "x")
-    slept = []
+def test_the_per_account_line_is_live_too(alice):
+    job_id = db.tgm_create_job(alice, [{"kind": "text", "text": "hi"}], 0.2, "both")
+    db.tgm_add_account(alice, job_id, 1, "09120000001", 2)
+    db.tgm_add_recipients(alice, job_id, 1, [
+        ("u1", {"kind": "user", "id": 1}, True),
+        ("u2", {"kind": "user", "id": 2}, False)])
+    db.tgm_set_recipient(alice, job_id, 0, "sent")
+    card = multi.progress_card(alice, job_id)
+    assert "09120000001" in card
+    assert "1 / 2" in card or "1 /2" in card, f"per-account count stale: {card}"
 
-    async def _sleep(s):
-        slept.append(s)
-    monkeypatch.setattr(tg_panel.asyncio, "sleep", _sleep)
-    asyncio.run(tg_panel._multi_progress_loop(alice, "job", _FakeMsg()))
-    assert slept, "the loop must sleep between polls, never busy-spin"
+
+def test_failures_show_on_the_account_line(alice):
+    job_id = db.tgm_create_job(alice, [{"kind": "text", "text": "hi"}], 0.2, "both")
+    db.tgm_add_account(alice, job_id, 1, "09120000001", 2)
+    db.tgm_add_recipients(alice, job_id, 1, [
+        ("u1", {"kind": "user", "id": 1}, True),
+        ("u2", {"kind": "user", "id": 2}, False)])
+    db.tgm_set_recipient(alice, job_id, 0, "sent")
+    db.tgm_set_recipient(alice, job_id, 1, "failed", "PeerFlood")
+    assert "⚠️" in multi.progress_card(alice, job_id)
+
+
+def test_the_live_card_belongs_to_the_engine_not_the_panel():
+    """It used to be started by the panel, so a RESUMED job and one revived by
+    restart recovery had no live card — two ways to watch a frozen number while
+    work was actually happening."""
+    assert hasattr(multi, "_live_card")
+    body = open(os.path.join(ROOT, "telegram_multi_send.py"), encoding="utf-8").read()
+    start = body.index("async def start(")
+    assert "_live_card" in body[start:start + 900], (
+        "start() must launch the live card so resume and recovery get one too")
+
+
+def test_the_live_card_stops_at_a_terminal_state(monkeypatch, alice):
+    job_id = db.tgm_create_job(alice, [{"kind": "text", "text": "hi"}], 0.2, "both")
+    db.tgm_update_job(alice, job_id, msg_id=42, state="running")
+
+    edits = []
+
+    class _Bot:
+        async def edit_message(self, cid, mid, text, buttons=None):
+            edits.append(text)
+            # Flip to a terminal state after the first edit.
+            db.tgm_update_job(alice, job_id, state="done")
+
+    monkeypatch.setattr(multi, "_bot", _Bot())
+    monkeypatch.setattr(multi.config, "TG_STATS_REFRESH", 0.0)
+    asyncio.run(multi._live_card(alice, job_id))
+    # It terminates rather than looping forever, and the LAST edit shows the
+    # finished state — the state is read before the edit, so a final pass is
+    # exactly what leaves the customer looking at a correct card.
+    assert 1 <= len(edits) <= 3, f"should settle quickly, got {len(edits)}"
+    assert "پایان" in edits[-1], "the final card must show the finished state"
+
+
+def test_the_live_card_survives_a_failed_edit(monkeypatch, alice):
+    """A customer who deleted the message makes the edit fail; the loop must still
+    exit cleanly rather than raise into the job."""
+    job_id = db.tgm_create_job(alice, [{"kind": "text", "text": "hi"}], 0.2, "both")
+    db.tgm_update_job(alice, job_id, msg_id=42, state="done")
+
+    class _Bot:
+        async def edit_message(self, *a, **k):
+            raise RuntimeError("message to edit not found")
+
+    monkeypatch.setattr(multi, "_bot", _Bot())
+    monkeypatch.setattr(multi.config, "TG_STATS_REFRESH", 0.0)
+    asyncio.run(multi._live_card(alice, job_id))      # must not raise
+
+
+def test_the_live_card_stops_if_the_job_is_deleted(monkeypatch, alice):
+    monkeypatch.setattr(multi.config, "TG_STATS_REFRESH", 0.0)
+    asyncio.run(multi._live_card(alice, "no-such-job"))
+
+
+def test_stopping_a_job_cancels_its_card_refresher(alice):
+    """Otherwise the refresher outlives the job it was watching."""
+    job_id = db.tgm_create_job(alice, [{"kind": "text", "text": "hi"}], 0.2, "both")
+
+    async def _go():
+        async def _forever():
+            await asyncio.sleep(3600)
+        multi._live[job_id] = asyncio.create_task(_forever())
+        await multi.stop(alice, job_id, grace=0.01)
+        return job_id in multi._live
+    assert asyncio.run(_go()) is False
 
 
 

@@ -42,6 +42,8 @@ import telegram_client as tg
 _tasks: dict = {}
 # job_id -> {"stop": bool}
 _controls: dict = {}
+# job_id -> the task that keeps the customer's card up to date
+_live: dict = {}
 
 # Injected so a running job can refresh the customer's live card.
 _bot = None
@@ -233,7 +235,46 @@ async def start(customer_id, job_id) -> dict:
     _controls[job_id] = {"stop": False}
     db.tgm_update_job(customer_id, job_id, state="running", stop_requested=0)
     _tasks[job_id] = asyncio.create_task(_run(customer_id, job_id))
+    # The live card belongs to the ENGINE, not to the screen that launched it.
+    # It used to be started by tg_panel, which meant a RESUMED job and a job
+    # revived by restart recovery had no live card at all — two ways to end up
+    # watching a frozen number while work was actually happening.
+    _live[job_id] = asyncio.create_task(_live_card(customer_id, job_id))
     return db.tgm_get_job(customer_id, job_id)
+
+
+async def _live_card(customer_id, job_id) -> None:
+    """Keep the job's card current until it reaches a terminal state.
+
+    Edits the message whose id the job row remembers, so it survives a resume and
+    a process restart. Skips the edit when nothing changed, because Telegram
+    rejects an edit with identical content and that error is pure noise.
+    """
+    terminal = {"done", "stopped", "failed", "frozen", "paused"}
+    last = ""
+    try:
+        while True:
+            await asyncio.sleep(config.TG_STATS_REFRESH)
+            job = db.tgm_get_job(customer_id, job_id)
+            if not job:
+                return
+            text = progress_card(customer_id, job_id)
+            if text != last and job.get("msg_id") and _bot:
+                last = text
+                try:
+                    from telethon import Button
+                    await _bot.edit_message(
+                        int(customer_id), int(job["msg_id"]), text,
+                        buttons=[[Button.inline("⛔ توقف",
+                                                f"tgjstop_{job_id}".encode())],
+                                 [Button.inline("📊 جزئیات",
+                                                f"tgjob_{job_id}".encode())]])
+                except Exception:      # noqa: BLE001 - a failed edit is not fatal
+                    pass
+            if job.get("state") in terminal:
+                return
+    except asyncio.CancelledError:
+        return
 
 
 async def stop(customer_id, job_id, grace: float = 3.0) -> dict:
@@ -256,6 +297,10 @@ async def stop(customer_id, job_id, grace: float = 3.0) -> dict:
             task.cancel()
         except Exception:
             pass
+    # The card refresher would otherwise outlive the job it was watching.
+    live = _live.pop(job_id, None)
+    if live and not live.done():
+        live.cancel()
     return db.tgm_get_job(customer_id, job_id)
 
 
@@ -499,6 +544,7 @@ def status(customer_id, job_id) -> dict | None:
         return None
     job["counts"] = db.tgm_counts(customer_id, job_id)
     job["accounts"] = db.tgm_job_accounts(customer_id, job_id)
+    job["per_account"] = db.tgm_counts_per_account(customer_id, job_id)
     return job
 
 
@@ -507,8 +553,19 @@ def progress_card(customer_id, job_id) -> str:
     if not job:
         return cards.card("📨 ارسال چنداکانتی", ["جاب پیدا نشد."])
     total = int(job.get("total") or 0)
-    done = int(job.get("sent_count") or 0) + int(job.get("failed_count") or 0) \
-        + int(job.get("skipped_count") or 0)
+
+    # LIVE counts, from the recipients table.
+    #
+    # This card used to read job["sent_count"], a column that _run_account only
+    # writes when it FINISHES an account — so a job sending to two thousand people
+    # displayed 0/2000 the entire time and looked frozen. The recipients table is
+    # updated per message, so it is the only source that actually moves.
+    live = job.get("counts") or {}
+    sent = int(live.get("sent", job.get("sent_count") or 0))
+    failed = int(live.get("failed", job.get("failed_count") or 0))
+    skipped = int(live.get("skipped", job.get("skipped_count") or 0))
+    done = sent + failed + skipped
+
     labels = {"queued": "در صف", "running": "در حال اجرا", "waiting": "در انتظار",
               "stop_requested": "در حال توقف", "stopped": "متوقف شد",
               "paused": "نیمه‌کاره", "done": "پایان", "failed": "خطا",
@@ -517,9 +574,9 @@ def progress_card(customer_id, job_id) -> str:
         cards.kv("Job", job.get("job_id")),
         cards.kv("State", labels.get(job.get("state"), job.get("state"))),
         cards.kv("Progress", f"{cards.bar(done, max(1, total))}  {done}/{total}"),
-        cards.kv("Sent", cards.num(job.get("sent_count") or 0)),
-        cards.kv("Failed", cards.num(job.get("failed_count") or 0)),
-        cards.kv("Skipped", cards.num(job.get("skipped_count") or 0)),
+        cards.kv("Sent", cards.num(sent)),
+        cards.kv("Failed", cards.num(failed)),
+        cards.kv("Skipped", cards.num(skipped)),
         cards.kv("Mutual first", cards.num(job.get("mutual_total") or 0)),
     ]
     # Where the time actually goes. Without this, "sending is slow" is a guess:
@@ -536,13 +593,21 @@ def progress_card(customer_id, job_id) -> str:
     if job.get("current_phone"):
         rows.append(cards.kv("Current", job["current_phone"]))
     rows.append(cards.LINE)
+    # Per account, also from the live table rather than the account row, which is
+    # written only when that account finishes.
+    per_account = job.get("per_account") or {}
     for account in job.get("accounts") or []:
         mark = {"done": "✅", "running": "▶️", "failed": "🔴",
                 "stopped": "⛔", "skipped": "⏭", "pending": "▫️"}.get(
                     account.get("state"), "▫️")
-        rows.append(f"{mark} {account['phone']} → "
-                    f"✉️{cards.num(account.get('sent_count') or 0)}"
-                    f" / {cards.num(account.get('total') or 0)}")
+        seen = per_account.get(int(account["account_id"]), {})
+        acc_sent = int(seen.get("sent", account.get("sent_count") or 0))
+        acc_total = int(account.get("total") or 0) or sum(seen.values())
+        line = (f"{mark} {account['phone']} → "
+                f"✉️{cards.num(acc_sent)} / {cards.num(acc_total)}")
+        if seen.get("failed"):
+            line += f"  ⚠️{cards.num(seen['failed'])}"
+        rows.append(line)
     return cards.panel_card("📨 - #tg_multi_send", rows)
 
 

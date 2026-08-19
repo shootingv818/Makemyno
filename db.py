@@ -3055,6 +3055,26 @@ def tgm_counts(customer_id, job_id) -> dict:
     return {r["state"]: int(r["n"]) for r in rows}
 
 
+def tgm_counts_per_account(customer_id, job_id) -> dict:
+    """{account_id: {state: n}} — live, straight from the recipients table.
+
+    The tg_multi_accounts row only gets its sent_count when the account FINISHES,
+    so a per-account line built from it reads 0 for the whole run. This is the
+    same reason the job-level counters could not drive the progress card.
+    """
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    rows = _rows(conn.execute(
+        "SELECT account_id, state, COUNT(*) AS n FROM tg_multi_recipients "
+        "WHERE job_id = ? AND customer_id = ? GROUP BY account_id, state",
+        (str(job_id), cid)))
+    conn.close()
+    out: dict = {}
+    for row in rows:
+        out.setdefault(int(row["account_id"]), {})[row["state"]] = int(row["n"])
+    return out
+
+
 def tgm_delete_job(customer_id, job_id) -> None:
     cid = _require_cid(customer_id)
     conn = _conn()
