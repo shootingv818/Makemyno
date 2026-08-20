@@ -469,6 +469,68 @@ def build_app():
             _release(key, "send")
             await _settle()
 
+    @app.post("/session/inspect")
+    async def session_inspect(body: Account, authorization: str = Header(None)):
+        """Report what this machine actually holds for one account. No connect.
+
+        The single question that mattered all along — "does the session on THIS
+        server have an auth and an RSA key?" — could not be answered without
+        SSHing into the box. INVALID_AUTH from addChannel does not distinguish
+        between a missing file, a file written for a different phone form, and a
+        file with no private_key, and those need completely different fixes.
+
+        Read-only and offline: it never opens a connection, so it is safe to call
+        while a job is running.
+        """
+        _auth(authorization)
+        path = rb.session_path(body.phone, body.customer_id)
+        file_path = path if path.endswith(".rp") else path + ".rp"
+        out = {"ok": True, "phone_given": body.phone,
+               "phone_normalized": rb.normalize_phone(body.phone),
+               "session_path": file_path,
+               "exists": os.path.exists(file_path),
+               "size": 0, "has_auth": False, "has_private_key": False,
+               "has_guid": False, "signable": False, "detail": ""}
+        if not out["exists"]:
+            out["detail"] = ("no session file on this server — the account was "
+                             "logged in elsewhere, or never placed here")
+            return out
+        try:
+            out["size"] = os.path.getsize(file_path)
+            import sqlite3
+            conn = sqlite3.connect(file_path)
+            try:
+                row = conn.execute(
+                    "select phone, auth, guid, agent, private_key "
+                    "from session").fetchone()
+            finally:
+                conn.close()
+            if not row:
+                out["detail"] = ("the session file exists but holds NO row — it "
+                                 "was created empty, most likely by a lookup on a "
+                                 "differently formatted phone number")
+                return out
+            out["stored_phone"] = row[0]
+            out["has_auth"] = bool(row[1])
+            out["has_guid"] = bool(row[2])
+            out["has_private_key"] = bool(row[4])
+            try:
+                out["signable"] = rb._import_key_from_private(row[4]) is not None
+            except Exception as exc:      # noqa: BLE001
+                out["signable"] = False
+                out["detail"] = f"private key unusable: {type(exc).__name__}"
+            if out["has_auth"] and out["signable"]:
+                out["detail"] = "session looks complete and signable"
+            elif not out["has_auth"]:
+                out["detail"] = "no auth stored — signed AND unsigned calls fail"
+            elif not out["has_private_key"]:
+                out["detail"] = ("no private_key stored — reads work, every SIGNED "
+                                 "call returns INVALID_AUTH. Needs a fresh login.")
+        except Exception as exc:      # noqa: BLE001
+            out["ok"] = False
+            out["detail"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+        return out
+
     @app.post("/upload/prepare")
     async def upload_prepare(body: UploadPrepare,
                             authorization: str = Header(None)):

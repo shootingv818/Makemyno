@@ -372,8 +372,19 @@ async def _run_send_local(customer_id, acc, mode, text, targets, ctl,
     while True:
         consecutive = 0
         hit_max = False
-        # One fresh connection per attempt: entering this closes any warm socket
-        # first, so exactly one connection exists for the account while we send.
+        # Decide whether we are allowed to send BEFORE opening anything. The
+        # owner's emergency freeze and a stop request must both be honoured
+        # without touching the session at all — opening a connection only to
+        # discover we are frozen is exactly the pointless session churn the
+        # freeze exists to prevent.
+        if ctl["stop"]:
+            ctl["state"] = "stopped"
+            ctl["reason"] = "manual_stop"
+            return
+        if db.are_sends_frozen():
+            ctl["state"] = "frozen"
+            ctl["reason"] = "owner froze all sends"
+            return
         async with account_conn.fresh_connection(customer_id, phone) as client:
             if mode == "marker" and message_id is None:
                 # Resolved on the SAME connection we are about to send on, the

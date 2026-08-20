@@ -48,9 +48,47 @@ def session_dir(customer_id) -> str:
 
 
 def session_path(phone: str, customer_id) -> str:
-    """Absolute path of one account's session file, scoped to its customer."""
-    safe = "".join(ch for ch in str(phone) if ch.isdigit())
+    """Absolute path of one account's session file, scoped to its customer.
+
+    The number is NORMALISED here, not merely stripped of punctuation. It used to
+    be `"".join(ch for ch in phone if ch.isdigit())`, so the SAME account landed on
+    two different files depending on what the caller happened to hold:
+
+        session_path("09227458187")  -> acc_09227458187
+        session_path("989227458187") -> acc_989227458187
+
+    start_login and account_conn normalise first, so they agreed. Callers that
+    pass the number straight from the database — which stores it as the customer
+    typed it — did not. And rubpy's SQLiteSession CREATES the file it is pointed
+    at, so asking for the wrong path silently produced an EMPTY session rather
+    than an error: connect() then read no auth, every request went out
+    unauthenticated, and the first signed call answered INVALID_AUTH.
+
+    Normalising in here means every caller lands on one file no matter which form
+    of the number it is holding.
+    """
+    safe = normalize_phone(phone)
     return os.path.join(session_dir(customer_id), f"acc_{safe}")
+
+
+def is_auth_failure(err: Exception) -> bool:
+    """Is this the platform saying the session itself is not valid?
+
+    Lives here as well as in account_conn because the read helpers in this module
+    must be able to tell an auth failure from an ordinary hiccup without importing
+    account_conn (which imports this module).
+    """
+    text = str(err).upper()
+    return ("INVALID_AUTH" in text or "INVALIDAUTH" in text
+            or "NOT_REGISTERED" in text or "AUTH_FROM_ANOTHER" in text)
+
+
+class SessionNotSignable(RuntimeError):
+    """The session cannot sign requests, so every signed call would be refused.
+
+    Raised instead of letting the client reach Rubika and come back with a bare
+    INVALID_AUTH that names nothing. The message says which piece is missing.
+    """
 
 
 def normalize_phone(phone: str) -> str:
@@ -83,23 +121,58 @@ async def connect_ready(client: Client):
     await client.connect()
     auth = getattr(client, "auth", None)
     private_key = getattr(client, "private_key", None)
-    try:
-        if auth is not None and getattr(client, "key", None) in (None, ""):
+
+    # WHY THIS FUNCTION IS LOAD-BEARING, AND WHY IT MUST NOT SWALLOW
+    #
+    # From rubpy's own source: connect() reads only auth, guid and private_key
+    # out of the session file. It never sets decode_auth or import_key — those
+    # are populated ONLY by start(), the interactive login path we do not use.
+    # And network.send builds every api_version-6 request as
+    #
+    #     data["auth"] = client.decode_auth
+    #     data["sign"] = Crypto.sign(client.import_key, data["data_enc"])
+    #
+    # so a client whose decode_auth or import_key is None talks to Rubika with no
+    # identity and no signature. The server answers INVALID_AUTH.
+    #
+    # Every step below used to sit in its own `try: ... except Exception: pass`.
+    # When one failed the client was still returned, looking perfectly healthy,
+    # and the failure surfaced hundreds of lines away as
+    # "rubpy.exceptions.InvalidAuth on addChannel" — which reads as a channel bug.
+    # Hours went into channels, connection shapes and session placement because
+    # of it.
+    #
+    # Now each piece is rebuilt and then CHECKED, and a client that cannot sign
+    # says so, in these words, before it ever reaches the platform.
+    missing = []
+
+    if auth in (None, ""):
+        missing.append("auth (the session file has no auth — it was never "
+                       "written, or it was written for a different phone/path)")
+    else:
+        if getattr(client, "key", None) in (None, ""):
             client.key = Crypto.passphrase(auth)
-    except Exception:
-        pass
-    try:
-        if auth is not None:
-            client.decode_auth = Crypto.decode_auth(auth)
-    except Exception:
-        pass
-    try:
-        if private_key is not None and getattr(client, "import_key", None) is None:
-            ik = _import_key_from_private(private_key)
-            if ik is not None:
-                client.import_key = ik
-    except Exception:
-        pass
+        client.decode_auth = Crypto.decode_auth(auth)
+        if not client.decode_auth:
+            missing.append("decode_auth (Crypto.decode_auth returned nothing)")
+
+    if private_key in (None, ""):
+        missing.append("private_key (the session file has no RSA key, so nothing "
+                       "can be signed — this account must be logged in again)")
+    elif getattr(client, "import_key", None) is None:
+        try:
+            client.import_key = _import_key_from_private(private_key)
+        except Exception as exc:      # noqa: BLE001
+            missing.append(f"import_key ({type(exc).__name__}: {str(exc)[:120]})")
+        else:
+            if client.import_key is None:
+                missing.append("import_key (the private key is not a usable "
+                               "RSA key)")
+
+    if missing:
+        raise SessionNotSignable(
+            "this session cannot sign requests, so Rubika will refuse every "
+            "signed call with INVALID_AUTH — missing: " + "; ".join(missing))
     return client
 
 
@@ -116,16 +189,50 @@ def _get(obj, *names):
     return None
 
 
+PEM_HEAD = "-----BEGIN RSA PRIVATE KEY-----"
+PEM_TAIL = "-----END RSA PRIVATE KEY-----"
+
+
+def _as_pem(private_key) -> str | None:
+    """Return the private key as a PEM document RSA.import_key will accept.
+
+    rubpy only repairs a bare key in Client.__init__ — it wraps a body that lacks
+    the BEGIN/END lines. A key that arrives any other way (read back out of the
+    session file, or restored from a portable session token) is handed to
+    RSA.import_key exactly as stored, and if the armour is missing that raises.
+    We used to swallow that, leave import_key as None, and let every signed
+    request go out unsigned.
+    """
+    if private_key is None:
+        return None
+    if isinstance(private_key, (bytes, bytearray)):
+        try:
+            private_key = private_key.decode()
+        except Exception:      # noqa: BLE001
+            return None
+    text = str(private_key).strip()
+    if not text:
+        return None
+    if PEM_HEAD in text:
+        return text
+    return f"{PEM_HEAD}\n{text}\n{PEM_TAIL}"
+
+
 def _import_key_from_private(private_key):
-    """Build the signing key exactly like rubpy start.py does."""
-    try:
-        from Crypto.PublicKey import RSA
-        from Crypto.Signature import pkcs1_15
-        if private_key is not None:
-            return pkcs1_15.new(RSA.import_key(private_key.encode()))
-    except Exception:
-        pass
-    return None
+    """Build the signing key exactly like rubpy start.py does.
+
+    rubpy signs EVERY api_version-6 request with
+    ``Crypto.sign(client.import_key, data_enc)`` and populates import_key ONLY in
+    start(); connect() leaves it None. So this is the one thing standing between a
+    session file and a usable client, and returning None here means every signed
+    call is refused with INVALID_AUTH.
+    """
+    pem = _as_pem(private_key)
+    if pem is None:
+        return None
+    from Crypto.PublicKey import RSA
+    from Crypto.Signature import pkcs1_15
+    return pkcs1_15.new(RSA.import_key(pem.encode()))
 
 
 def import_session(phone: str, customer_id, values: dict) -> bool:
@@ -144,6 +251,16 @@ def import_session(phone: str, customer_id, values: dict) -> bool:
     """
     if not values or not values.get("auth"):
         return False
+    # A session with no RSA key can READ but can never SIGN, so every channel
+    # create, member add and forward would be refused with INVALID_AUTH. Writing
+    # one and reporting success is worse than writing nothing: session_store.place
+    # then tells run_with_repair the session was repaired, the retry fails
+    # identically, and the log blames the platform.
+    if not values.get("private_key"):
+        raise SessionNotSignable(
+            "refusing to write a session with no private_key: it could only read, "
+            "and every signed call would come back INVALID_AUTH. This account "
+            "needs a fresh login.")
     normalized = normalize_phone(phone or values.get("phone") or "")
     if not normalized:
         return False
@@ -620,7 +737,15 @@ async def find_marked_message(client: Client, marker: str):
                 result = await client.get_messages(saved_guid, max_id, "20")
             else:
                 result = await client.get_messages(saved_guid, "0", "20")
-        except Exception:
+        except Exception as exc:      # noqa: BLE001
+            # An AUTH failure must NOT be swallowed. This bare `except: break` is
+            # what hid a dead session for hours: reading Saved returned None as
+            # though the marker simply did not exist, the flow carried on, and the
+            # first error anyone ever saw was INVALID_AUTH from addChannel — so the
+            # channel code was blamed for a session problem. A paging hiccup still
+            # just stops paging; a session problem is reported.
+            if is_auth_failure(exc):
+                raise
             break
         messages = getattr(result, "messages", None)
         if messages is None and isinstance(result, dict):
