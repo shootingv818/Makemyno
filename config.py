@@ -194,6 +194,15 @@ CONTACT_DEFAULT_FIRST = os.getenv("CONTACT_DEFAULT_FIRST", "Friend").strip()
 CONTACT_PROGRESS_EVERY = _float("CONTACT_PROGRESS_EVERY", 4.0)
 CONTACT_REMOTE_CHUNK = _int("CONTACT_REMOTE_CHUNK", 25)
 
+# Consecutive-error brake for contact adding, ported from the reference project.
+# Rubika answers a burst of add_address_book calls with errors long before it
+# revokes anything: the cure is to PAUSE and carry on, not to abandon the batch.
+# Without these two knobs the worker had no brake at all, so a rate-limit burst
+# was counted as N individual failures and the customer got "0 added" with no
+# explanation for a list that was perfectly fine.
+CONTACT_MAX_ERRORS = _int("CONTACT_MAX_ERRORS", 5)      # consecutive errors
+CONTACT_RESUME_WAIT = _int("CONTACT_RESUME_WAIT", 60)   # pause after the brake
+
 # HARD input cap: the biggest numbers file we will accept in one go, so nobody
 # can hand us a million lines and take the service down.
 CONTACT_IMPORT_MAX = _int("CONTACT_IMPORT_MAX", 20000)

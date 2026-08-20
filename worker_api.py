@@ -88,6 +88,12 @@ try:
         message_id: str | int | None = None
         delay: float = 1.0
         max_errors: int = 5
+        # Auto-resume knobs. Rubika answers a burst of forwards with errors long
+        # before it revokes anything, so a burst must PAUSE the job and resume it,
+        # not end it. Defaults keep old callers working.
+        send_timeout: int = 60
+        resume_wait: int = 300
+        max_retries: int = 2
 
     class SessionImport(Account):
         auth: str | None = None
@@ -98,6 +104,15 @@ try:
     class ChannelCreate(Account):
         title: str
         description: str | None = None
+        # The marked post is forwarded into the new channel as its first
+        # message. Optional so a caller that predates this field still works
+        # (it just gets an empty channel, which is what ALL callers used to get).
+        marker: str = ""
+
+    class UploadPrepare(Account):
+        file_b64: str
+        file_name: str = ""
+        caption: str = ""
 
     class ChannelAdd(Account):
         channel_guid: str
@@ -145,6 +160,41 @@ except ImportError:      # pragma: no cover - the master does not need pydantic
 
 def _key(customer_id, phone: str) -> str:
     return busy.key_for(phone, customer_id=customer_id, platform="rb")
+
+
+async def _confirm_session_dead(customer_id, phone: str) -> bool:
+    """True only when a suspected dead session is CONFIRMED dead.
+
+    An auth-looking error is not proof: a muted or banned recipient, a throttle
+    or a network hiccup produce the same text. The check runs on a connection of
+    its own so the caller's socket is left alone, and a confirmed-dead session is
+    reported to the master through the usual notifier.
+    """
+    import account_conn
+    try:
+        dead = await asyncio.wait_for(
+            account_conn.verify_session_dead(customer_id, phone), timeout=45)
+    except Exception:      # noqa: BLE001 - an inconclusive probe means "alive"
+        return False
+    if dead:
+        await account_conn.notify_invalid(customer_id, phone)
+        return True
+    return False
+
+
+async def _sleep_with_stop(job: dict, seconds: float, step: float = 2.0) -> None:
+    """Sleep up to `seconds`, but give up early once the job is stopped.
+
+    A plain asyncio.sleep(resume_wait) would make a stop request sit unanswered
+    for five minutes, so the customer presses stop and nothing happens.
+    """
+    waited = 0.0
+    while waited < seconds:
+        if job.get("stop"):
+            return
+        chunk = min(step, seconds - waited)
+        await asyncio.sleep(chunk)
+        waited += chunk
 
 
 def _worker_code_version() -> str:
@@ -419,6 +469,71 @@ def build_app():
             _release(key, "send")
             await _settle()
 
+    @app.post("/upload/prepare")
+    async def upload_prepare(body: UploadPrepare,
+                            authorization: str = Header(None)):
+        """Upload a file into the account's Saved Messages and return its id.
+
+        The whole auto-upload path was missing from this worker, so a media
+        campaign had only one route: the customer posting the file by hand in
+        Saved and tagging it with the marker. Anything else reported
+        "marker not found".
+
+        Deliberately never raises: on failure it returns ok=False WITH the reason
+        so the master can fall back to the marker flow instead of the request
+        blowing up as a 500.
+        """
+        _auth(authorization)
+        try:
+            raw = base64.b64decode(body.file_b64)
+        except Exception as exc:      # noqa: BLE001
+            return {"ok": False,
+                    "error": f"bad file payload: {type(exc).__name__}"}
+        if not raw:
+            return {"ok": False, "error": "empty file payload"}
+
+        up_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "data", "uploads")
+        os.makedirs(up_dir, exist_ok=True)
+        # basename only: never let a caller-supplied name escape up_dir with an
+        # absolute path or a ../ traversal.
+        fname = os.path.basename(body.file_name or "") or "file.bin"
+        path = os.path.join(up_dir, fname)
+        try:
+            with open(path, "wb") as fh:
+                fh.write(raw)
+        except Exception as exc:      # noqa: BLE001
+            return {"ok": False,
+                    "error": f"write failed: {type(exc).__name__}: {str(exc)[:120]}"}
+
+        key = await _hold_or_409(body.customer_id, body.phone, "upload")
+        try:
+            import account_conn
+
+            async def _work(client):
+                saved_guid, mid = await rb.upload_file_to_self(
+                    client, path, caption=body.caption or "", file_name=fname)
+                recipients = await rb.get_ordered_recipients(client)
+                targets = [str(r.get("guid") if isinstance(r, dict) else r)
+                           for r in (recipients or [])
+                           if (r.get("guid") if isinstance(r, dict) else r)]
+                return str(saved_guid), mid, targets
+
+            saved_guid, mid, targets = await account_conn.fresh_call(
+                body.customer_id, body.phone, _work, timeout=300)
+            return {"ok": True, "from_guid": saved_guid, "message_id": mid,
+                    "targets": targets, "total": len(targets)}
+        except Exception as exc:      # noqa: BLE001 - report, never 500
+            return {"ok": False,
+                    "error": f"upload failed: {type(exc).__name__}: {str(exc)[:160]}"}
+        finally:
+            _release(key, "upload")
+            await _settle()
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
     # ---- sending ---------------------------------------------------------- #
     @app.post("/send/start")
     async def send_start(body: SendStart, authorization: str = Header(None)):
@@ -426,50 +541,128 @@ def build_app():
         key = await _hold_or_409(body.customer_id, body.phone, "send")
         job_id = uuid.uuid4().hex[:12]
         job = {"state": "running", "sent": 0, "failed": 0, "total": len(body.targets),
-               "stop": False, "error": "", "key": key,
-               "started": config.now_str()}
+               "stop": False, "error": "", "key": key, "retry_count": 0,
+               "reason": "", "started": config.now_str()}
         _jobs[job_id] = job
         job["task"] = asyncio.create_task(_run_send(job_id, body))
         return {"ok": True, "job_id": job_id, "total": job["total"]}
 
     async def _run_send(job_id: str, body: SendStart) -> None:
+        """Send to every target, on ONE connection the job owns, with a brake.
+
+        Two things here were wrong and both had to change together.
+
+        1) It called account_conn.call() PER RECIPIENT, i.e. over the shared warm
+           socket. When a send raised something auth-looking, account_conn.call
+           ran verify_session_dead(), and that drops and reopens the connection —
+           the very socket the job was sending on. So one muted recipient tore
+           down a healthy send mid-flight, and the rapid reconnect is itself what
+           makes Rubika revoke a session. The job now holds its OWN dedicated
+           connection for its whole life and confirms a suspected dead session on
+           a separate connection, leaving its own socket untouched. This is the
+           reference's shape, which its own comment calls the only difference from
+           the proven build.
+
+        2) A burst of errors ended the job for good (state="error_burst"). Rubika
+           throttles long before it revokes, so a burst has to PAUSE and resume:
+           wait resume_wait, reconnect a fresh client, carry on from where we
+           stopped, up to max_retries times.
+        """
         job = _jobs[job_id]
         import account_conn
-        consecutive = 0
+
+        targets = list(body.targets)
+        total = len(targets)
+        idx = 0
+        delay = max(0.05, float(body.delay or 1.0))
+        max_errors = max(1, int(body.max_errors or 5))
+        max_retries = max(0, int(body.max_retries or 0))
+        send_timeout = max(5, int(body.send_timeout or config.SEND_TIMEOUT))
+
+        async def _send_one(client, guid):
+            if body.mode == "text":
+                return await rb.send_text(client, guid, body.text)
+            return await rb.forward_message(client, body.from_guid, guid,
+                                            body.message_id)
+
         try:
-            for target in body.targets:
+            while True:
+                consecutive = 0
+                hit_max = False
+                # A fresh dedicated connection per attempt. Entering this closes
+                # any warm socket for the session first, so there is exactly one
+                # connection for the account while the job runs.
+                async with account_conn.fresh_connection(
+                        body.customer_id, body.phone) as client:
+                    while idx < total:
+                        if job["stop"]:
+                            job["state"] = "stopped"
+                            job["reason"] = "manual_stop"
+                            return
+                        guid = targets[idx]
+                        idx += 1
+                        try:
+                            await asyncio.wait_for(_send_one(client, guid),
+                                                   timeout=send_timeout)
+                            job["sent"] += 1
+                            consecutive = 0     # CONSECUTIVE errors only
+                        except Exception as exc:      # noqa: BLE001
+                            # Do NOT tear down this client on an auth-looking
+                            # error. Confirm on a separate connection; if the
+                            # session is alive it was transient and we keep going
+                            # on the SAME socket.
+                            if account_conn.is_auth_error(exc):
+                                if await _confirm_session_dead(body.customer_id,
+                                                               body.phone):
+                                    job["state"] = "auth_failed"
+                                    job["error"] = (f"{type(exc).__name__}: "
+                                                    f"{str(exc)[:120]}")
+                                    job["reason"] = "invalid_auth"
+                                    return
+                            job["failed"] += 1
+                            consecutive += 1
+                            job["error"] = (f"{type(exc).__name__}: "
+                                            f"{str(exc)[:120]}")
+                            if consecutive >= max_errors:
+                                hit_max = True
+                                break
+                        await _sleep_with_stop(job, delay)
+
+                if not hit_max:
+                    break                        # the whole list is done
+                if job["retry_count"] >= max_retries:
+                    job["state"] = "error_burst"
+                    job["reason"] = (f"max_errors({max_errors}) reached, "
+                                     f"retries exhausted at {idx}/{total}")
+                    return
+                job["retry_count"] += 1
+                job["state"] = "waiting"
+                job["reason"] = (f"paused after {max_errors} consecutive errors; "
+                                 f"resuming at {idx}/{total}")
+                await _sleep_with_stop(job, float(body.resume_wait or 300))
                 if job["stop"]:
                     job["state"] = "stopped"
+                    job["reason"] = "manual_stop"
                     return
-                try:
-                    if body.mode == "text":
-                        async def _one(client, guid=target):
-                            return await rb.send_text(client, guid, body.text)
-                    else:
-                        async def _one(client, guid=target):
-                            return await rb.forward_message(
-                                client, body.from_guid, guid, body.message_id)
+                job["state"] = "running"
+                # loop round: the `async with` above opens a brand-new client.
 
-                    await account_conn.call(body.customer_id, body.phone, _one,
-                                            timeout=config.SEND_TIMEOUT)
-                    job["sent"] += 1
-                    consecutive = 0
-                except account_conn.InvalidAuthError:
-                    job["state"] = "auth_failed"
-                    job["error"] = "session invalid"
-                    return
-                except Exception as exc:      # noqa: BLE001
-                    job["failed"] += 1
-                    consecutive += 1
-                    job["error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
-                    if consecutive >= int(body.max_errors or 5):
-                        job["state"] = "error_burst"
-                        return
-                await asyncio.sleep(max(0.05, float(body.delay or 1.0)))
-            job["state"] = "done"
+            # Never report a cheerful "done" for a job that reached nobody.
+            if total and not job["sent"]:
+                job["state"] = "failed"
+                job["reason"] = (job["error"]
+                                 or f"0 of {total} targets were reached")
+            else:
+                job["state"] = "done"
+                job["reason"] = ""
         except asyncio.CancelledError:
             job["state"] = "stopped"
+            job["reason"] = "cancelled"
             raise
+        except Exception as exc:      # noqa: BLE001 - the reason must survive
+            job["state"] = "failed"
+            job["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+            job["reason"] = "fatal"
         finally:
             _release(job["key"], "send")
             await _settle()
@@ -530,13 +723,41 @@ def build_app():
 
             # Creating a channel is a signed call Rubika rejects with
             # INVALID_AUTH over a reused warm socket -> fresh single connection.
+            #
+            # All THREE steps share that one connection, exactly as the reference
+            # does. This endpoint used to call rb.create_channel and nothing else:
+            # it never looked for the marked post and never forwarded it, and the
+            # master never even sent a marker. So every channel campaign produced
+            # a channel with NO content in it — the accounts were then seeded into
+            # an empty channel, which is why "ساخت کانال" looked like it worked
+            # (a guid came back) while accomplishing nothing.
             async def _work(client):
-                return await rb.create_channel(client, body.title,
+                message_id = None
+                if body.marker:
+                    message_id = await rb.find_marked_message(client, body.marker)
+                guid = await rb.create_channel(client, body.title,
                                                body.description)
+                forwarded = False
+                forward_error = ""
+                if message_id and guid:
+                    saved_guid = await rb.get_self_guid(client)
+                    try:
+                        await rb.forward_message(client, saved_guid, guid,
+                                                 message_id)
+                        forwarded = True
+                    except Exception as exc:      # noqa: BLE001
+                        # The channel exists, so this is NOT a failure of the
+                        # endpoint — but the reason must survive, otherwise the
+                        # owner sees an empty channel and no explanation.
+                        forward_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+                return guid, bool(message_id), forwarded, forward_error
 
-            guid = await account_conn.fresh_call(body.customer_id, body.phone,
-                                                 _work, timeout=120)
-            return {"ok": True, "channel_guid": guid}
+            guid, marker_found, forwarded, forward_error = \
+                await account_conn.fresh_call(body.customer_id, body.phone,
+                                              _work, timeout=180)
+            return {"ok": True, "channel_guid": guid,
+                    "marker_found": marker_found, "forwarded": forwarded,
+                    "forward_error": forward_error}
         except Exception as exc:
             raise HTTPException(status_code=400,
                                 detail=f"{type(exc).__name__}: {str(exc)[:200]}")
@@ -572,32 +793,75 @@ def build_app():
     async def contacts_add(body: ContactsAdd, authorization: str = Header(None)):
         _auth(authorization)
         key = await _hold_or_409(body.customer_id, body.phone, "contacts")
-        added = not_user = failed = 0
-        guids = []
         try:
             import account_conn
-            for pair in body.pairs:
-                phone = str(pair[0]) if isinstance(pair, (list, tuple)) else str(pair)
-                name = (pair[1] if isinstance(pair, (list, tuple)) and len(pair) > 1
-                        else "") or config.CONTACT_DEFAULT_FIRST
 
-                async def _one(client, p=phone, n=name):
-                    return await rb.add_contact(client, p, first_name=n)
+            # The WHOLE batch runs inside ONE connection, the way the reference
+            # does it. It used to call account_conn.call() per number, so a list
+            # of 500 numbers acquired and released the session 500 times; that
+            # churn is exactly what Rubika treats as suspicious.
+            #
+            # It also had no brake and no memory of why anything failed: the
+            # handler was `except Exception: failed += 1`, so a throttled batch
+            # came back as "0 added, 500 failed" with not one reason recorded, and
+            # the run ended instead of pausing. And success was tested with
+            # rb._guid_of(res), while add_contact's documented contract is
+            # {"on_rubika": bool, "guid": str|None} — a number that IS on Rubika
+            # but whose response omitted the guid was counted as "not a user".
+            async def _do(client):
+                added = 0          # the number is a real Rubika account
+                not_user = 0       # in the address book, but not on Rubika
+                failed = 0
+                guids = []
+                results = []
+                last_error = ""
+                consecutive = 0
+                for pair in (body.pairs or []):
+                    is_pair = isinstance(pair, (list, tuple))
+                    raw = str(pair[0]) if is_pair else str(pair)
+                    name = ((pair[1] if is_pair and len(pair) > 1 else "")
+                            or config.CONTACT_DEFAULT_FIRST)
+                    phone = rb.normalize_phone(raw)
+                    if not phone:
+                        continue
+                    try:
+                        res = await asyncio.wait_for(
+                            rb.add_contact(client, phone, first_name=name),
+                            timeout=config.SEND_TIMEOUT)
+                        consecutive = 0
+                        on_rubika = bool((res or {}).get("on_rubika"))
+                        guid = (res or {}).get("guid") if on_rubika else None
+                        if on_rubika:
+                            added += 1
+                            if guid:
+                                guids.append(guid)
+                        else:
+                            not_user += 1
+                        results.append({"phone": phone, "on_rubika": on_rubika,
+                                        "guid": guid})
+                    except Exception as exc:      # noqa: BLE001
+                        failed += 1
+                        consecutive += 1
+                        last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+                        results.append({"phone": phone, "on_rubika": False,
+                                        "guid": None, "error": last_error})
+                        if consecutive >= config.CONTACT_MAX_ERRORS:
+                            # Throttled, almost certainly. Pause and carry on
+                            # rather than abandoning the rest of the list.
+                            await asyncio.sleep(config.CONTACT_RESUME_WAIT)
+                            consecutive = 0
+                    await asyncio.sleep(max(0.0, float(body.delay or 1.0)))
+                return {"added": added, "not_user": not_user, "failed": failed,
+                        "guids": guids, "results": results,
+                        "last_error": last_error}
 
-                try:
-                    res = await account_conn.call(body.customer_id, body.phone,
-                                                  _one, timeout=60)
-                    guid = rb._guid_of(res) if res else None   # noqa: SLF001
-                    if guid:
-                        added += 1
-                        guids.append(guid)
-                    else:
-                        not_user += 1
-                except Exception:      # noqa: BLE001
-                    failed += 1
-                await asyncio.sleep(max(0.05, float(body.delay or 1.0)))
-            return {"ok": True, "added": added, "not_user": not_user,
-                    "failed": failed, "guids": guids}
+            res = await account_conn.call(body.customer_id, body.phone, _do,
+                                          timeout=7200)
+            return {"ok": True, **res}
+        except Exception as exc:
+            # A batch that never ran is a failure WITH a reason, not "0 added".
+            raise HTTPException(status_code=400,
+                                detail=f"{type(exc).__name__}: {str(exc)[:200]}")
         finally:
             _release(key, "contacts")
             await _settle()

@@ -1560,6 +1560,110 @@ async def download_photo(client: Client, file_inline) -> bytes:
     raise RuntimeError("download() returned no bytes")
 
 
+# =========================================================================== #
+# AUTO-UPLOAD — put a file into the account's OWN Saved Messages and hand the
+# resulting (saved_guid, message_id) to the normal forward engine.
+#
+# Ported verbatim in behaviour from the reference project, which this repo had
+# dropped: without it the ONLY way to send media was for the customer to post it
+# by hand in Saved and tag it with the marker. There was no upload path at all,
+# so /upload/prepare could not exist and every media campaign silently degraded
+# to "marker not found".
+#
+# Two deliberate constraints, both learned the hard way in the reference:
+#   * send_document ONLY. rubpy 7.3.5 has no send_file, and the media senders
+#     re-type the payload — a zip or apk sent through them arrives as a
+#     gif/photo/video and is useless. Never substitute them.
+#   * do NOT trust the send result's shape. Confirm the upload by spotting a NEW
+#     message at the top of Saved Messages.
+# =========================================================================== #
+async def _newest_saved_message_id(client: Client, saved_guid: str):
+    """message_id of the most recent message in Saved Messages, or None.
+
+    Reuses the same get_messages() shape as find_marked_message so a rubpy build
+    that works for one works for the other.
+    """
+    try:
+        result = await client.get_messages(saved_guid, "0", "5")
+    except Exception:      # noqa: BLE001 - a read failure just means "unknown"
+        return None
+    messages = getattr(result, "messages", None)
+    if messages is None and isinstance(result, dict):
+        messages = result.get("messages", [])
+    if not messages:
+        return None
+    # Newest-first in the builds we target, but take the max id to be safe, and
+    # keep only numeric ids so the result is always int | None.
+    ids = []
+    for msg in messages:
+        try:
+            ids.append(int(_msg_id_of(msg)))
+        except (TypeError, ValueError):
+            continue
+    return max(ids) if ids else None
+
+
+async def upload_file_to_self(client: Client, file_path: str, caption: str = "",
+                              file_name: str = None):
+    """Upload a local file to Saved Messages; return (saved_guid, message_id).
+
+    Bounded to UPLOAD_TIMEOUT for the WHOLE operation so a stuck upload reports
+    itself instead of hanging the job; the caller then falls back to the marker
+    flow.
+    """
+    if not file_path or not os.path.exists(file_path):
+        raise RuntimeError("file not found for upload")
+    saved_guid = await get_self_guid(client)
+    text = caption or None
+    name = file_name or os.path.basename(file_path)
+
+    before = await _newest_saved_message_id(client, saved_guid)
+
+    fn = getattr(client, "send_document", None)
+    if fn is None:
+        raise RuntimeError("this rubpy build has no send_document()")
+
+    # Map arguments by NAME so the exact send_document signature never matters.
+    try:
+        params = [p for p in inspect.signature(fn).parameters.keys()
+                  if p != "self"]
+    except (TypeError, ValueError):
+        params = []
+    kwargs = {}
+    for param in params:
+        low = param.lower()
+        if low in ("object_guid", "guid", "chat_id", "chat_guid"):
+            kwargs[param] = saved_guid
+        elif low in ("document", "file", "path", "file_path", "media", "doc"):
+            kwargs[param] = file_path
+        elif "caption" in low or low == "text":
+            kwargs[param] = text
+        elif "file_name" in low or low in ("name", "filename"):
+            kwargs[param] = name
+    have_guid = any(k.lower() in ("object_guid", "guid", "chat_id", "chat_guid")
+                    for k in kwargs)
+    have_file = any(k.lower() in ("document", "file", "path", "file_path",
+                                  "media", "doc") for k in kwargs)
+
+    upload_timeout = 60
+    try:
+        coro = fn(**kwargs) if (have_guid and have_file) \
+            else fn(saved_guid, file_path, caption=text)
+        res = await asyncio.wait_for(coro, timeout=upload_timeout)
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"upload timed out after {upload_timeout}s")
+
+    # Prefer the id the send returned; otherwise confirm via the new top message
+    # in Saved. No media-sender fallback, ever.
+    mid = _msg_id_of(res)
+    if not mid:
+        after = await _newest_saved_message_id(client, saved_guid)
+        if after is not None and after != before:
+            mid = after
+    if not mid:
+        raise RuntimeError("send_document sent but no message id was found")
+    return saved_guid, mid
+
 
 # =========================================================================== #
 # update_end ADDITION — add a phone number to the account's contacts (address

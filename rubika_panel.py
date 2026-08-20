@@ -273,7 +273,7 @@ async def _run_send(customer_id, acc: dict, mode: str, text: str,
 
     ctl = {"stop": False, "pause": False, "sent": 0, "failed": 0,
            "total": len(targets), "phone": phone, "state": "running",
-           "last_error": ""}
+           "last_error": "", "reason": ""}
     _jobs[aid] = ctl
 
     async with busy.hold(key, "send", customer_id=customer_id,
@@ -324,61 +324,144 @@ async def _run_send(customer_id, acc: dict, mode: str, text: str,
     await _finish_send(customer_id, acc, ctl, owner_msg)
 
 
+async def _ctl_sleep(ctl, seconds: float, step: float = 2.0) -> None:
+    """Sleep, but wake up as soon as the job is stopped.
+
+    A flat asyncio.sleep(RESUME_WAIT) leaves a stop request unanswered for five
+    minutes, so the customer presses stop and nothing appears to happen.
+    """
+    waited = 0.0
+    while waited < seconds:
+        if ctl.get("stop"):
+            return
+        chunk = min(step, seconds - waited)
+        await asyncio.sleep(chunk)
+        waited += chunk
+
+
 async def _run_send_local(customer_id, acc, mode, text, targets, ctl,
                           delay, max_errors) -> None:
+    """Send from this machine, on ONE connection the job owns, with a brake.
+
+    Same two defects the worker path had, fixed the same way:
+
+      * it used account_conn.call() PER RECIPIENT, over the shared warm socket.
+        An auth-looking error there sends account_conn into verify_session_dead,
+        which drops and reopens that very socket mid-send — and the rapid
+        reconnect is itself what makes Rubika revoke a session. One muted
+        recipient could therefore kill a healthy run. The job now owns a
+        dedicated connection and confirms a suspect session elsewhere.
+      * a burst of errors ended the run for good. Rubika throttles long before it
+        revokes, so a burst pauses and resumes instead.
+    """
     import account_conn
     aid, phone = acc["id"], acc["phone"]
     marker = db.get_marker(customer_id)
     from_guid = message_id = None
 
-    if mode == "marker":
-        async def _find(client):
-            return (await rb.get_self_guid(client),
-                    await rb.find_marked_message(client, marker))
-        from_guid, message_id = await account_conn.call(customer_id, phone, _find,
-                                                       timeout=180)
-        # find_marked_message returns the id itself now, so this check actually
-        # works. It used to receive a 2-tuple, which is truthy even when the marker
-        # was missing, and then derived a None id from it.
-        if not message_id:
-            ctl["state"] = "no_marker"
-            return
+    targets = list(targets)
+    total = len(targets)
+    idx = 0
+    retries = 0
 
-    consecutive = 0
-    for target in targets:
+    async def _send_one(client, guid):
+        if mode == "text":
+            return await rb.send_text(client, guid, text)
+        return await rb.forward_message(client, from_guid, guid, message_id)
+
+    while True:
+        consecutive = 0
+        hit_max = False
+        # One fresh connection per attempt: entering this closes any warm socket
+        # first, so exactly one connection exists for the account while we send.
+        async with account_conn.fresh_connection(customer_id, phone) as client:
+            if mode == "marker" and message_id is None:
+                # Resolved on the SAME connection we are about to send on, the
+                # way the reference does it, instead of paying an extra
+                # connect/disconnect cycle before the run even starts.
+                from_guid = await rb.get_self_guid(client)
+                message_id = await rb.find_marked_message(client, marker)
+                # find_marked_message returns the id itself now, so this check
+                # actually works. It used to receive a 2-tuple, which is truthy
+                # even when the marker was missing, and then derived a None id.
+                if not message_id:
+                    ctl["state"] = "no_marker"
+                    ctl["reason"] = f"no saved message tagged «{marker}»"
+                    return
+
+            while idx < total:
+                if ctl["stop"]:
+                    ctl["state"] = "stopped"
+                    ctl["reason"] = "manual_stop"
+                    return
+                while ctl["pause"] and not ctl["stop"]:
+                    await asyncio.sleep(1)
+                if db.are_sends_frozen():
+                    # The owner's emergency stop: halt rather than keep burning
+                    # accounts.
+                    ctl["state"] = "frozen"
+                    ctl["reason"] = "owner froze all sends"
+                    return
+                target = targets[idx]
+                idx += 1
+                try:
+                    await asyncio.wait_for(_send_one(client, target),
+                                           timeout=config.SEND_TIMEOUT)
+                    ctl["sent"] += 1
+                    consecutive = 0
+                    db.mark_sent(customer_id, aid, target, platform="rb")
+                except Exception as exc:  # noqa: BLE001
+                    # Never tear down this client over an auth-looking error;
+                    # confirm on a separate connection and keep going if alive.
+                    if account_conn.is_auth_error(exc):
+                        dead = False
+                        try:
+                            dead = await asyncio.wait_for(
+                                account_conn.verify_session_dead(customer_id,
+                                                                 phone),
+                                timeout=45)
+                        except Exception:  # noqa: BLE001 - inconclusive = alive
+                            dead = False
+                        if dead:
+                            await account_conn.notify_invalid(customer_id, phone)
+                            ctl["state"] = "auth_failed"
+                            ctl["last_error"] = (f"{type(exc).__name__}: "
+                                                 f"{str(exc)[:120]}")
+                            ctl["reason"] = "invalid_auth"
+                            return
+                    ctl["failed"] += 1
+                    consecutive += 1
+                    # The type alone was useless for diagnosis; keep the message.
+                    ctl["last_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+                    if consecutive >= max_errors:
+                        hit_max = True
+                        break
+                await _ctl_sleep(ctl, delay)
+
+        if not hit_max:
+            break                                # the whole list is done
+        if retries >= config.RESUME_MAX_RETRIES:
+            ctl["state"] = "error_burst"
+            ctl["reason"] = (f"{max_errors} consecutive errors at {idx}/{total}; "
+                             f"retries exhausted. last: {ctl['last_error']}")
+            return
+        retries += 1
+        ctl["state"] = "waiting"
+        ctl["reason"] = (f"paused after {max_errors} consecutive errors; "
+                         f"resuming at {idx}/{total}")
+        await _ctl_sleep(ctl, float(config.RESUME_WAIT))
         if ctl["stop"]:
             ctl["state"] = "stopped"
+            ctl["reason"] = "manual_stop"
             return
-        while ctl["pause"] and not ctl["stop"]:
-            await asyncio.sleep(1)
-        if db.are_sends_frozen():
-            # The owner's emergency stop: halt rather than keep burning accounts.
-            ctl["state"] = "frozen"
-            return
-        try:
-            if mode == "text":
-                async def _one(client, guid=target):
-                    return await rb.send_text(client, guid, text)
-            else:
-                async def _one(client, guid=target):
-                    return await rb.forward_message(client, from_guid, guid,
-                                                    message_id)
-            await account_conn.call(customer_id, phone, _one,
-                                    timeout=config.SEND_TIMEOUT)
-            ctl["sent"] += 1
-            consecutive = 0
-            db.mark_sent(customer_id, aid, target, platform="rb")
-        except account_conn.InvalidAuthError:
-            ctl["state"] = "auth_failed"
-            return
-        except Exception as exc:  # noqa: BLE001
-            ctl["failed"] += 1
-            consecutive += 1
-            ctl["last_error"] = type(exc).__name__
-            if consecutive >= max_errors:
-                ctl["state"] = "error_burst"
-                return
-        await asyncio.sleep(delay)
+        ctl["state"] = "running"
+        # loop round: the `async with` above opens a brand-new client.
+
+    # Never report a cheerful finish for a run that reached nobody.
+    if total and not ctl["sent"]:
+        ctl["state"] = "failed"
+        ctl["reason"] = (ctl["last_error"]
+                         or f"0 of {total} targets were reached")
 
 
 async def _run_send_remote(customer_id, acc, w, mode, text, targets, ctl) -> None:
@@ -388,7 +471,13 @@ async def _run_send_remote(customer_id, acc, w, mode, text, targets, ctl) -> Non
     payload = {"customer_id": customer_id, "phone": phone,
                "targets": [str(t) for t in targets], "mode": mode,
                "text": text or "", "delay": db.get_delay(customer_id),
-               "max_errors": db.get_max_errors(customer_id)}
+               "max_errors": db.get_max_errors(customer_id),
+               # Auto-resume: a burst of platform errors has to pause the job and
+               # pick it up again, not end it. Without these the worker gave up
+               # permanently the first time Rubika throttled the account.
+               "send_timeout": config.SEND_TIMEOUT,
+               "resume_wait": config.RESUME_WAIT,
+               "max_retries": config.RESUME_MAX_RETRIES}
 
     if mode == "marker":
         prep = await worker.api_call(w, "POST", "/prepare", {
@@ -421,13 +510,20 @@ async def _run_send_remote(customer_id, acc, w, mode, text, targets, ctl) -> Non
         ctl["sent"] = int(status.get("sent", 0))
         ctl["failed"] = int(status.get("failed", 0))
         ctl["last_error"] = status.get("error") or ""
+        ctl["reason"] = status.get("reason") or ""
         remote_state = status.get("state")
-        if remote_state not in ("running",):
-            ctl["state"] = {"done": "done", "stopped": "stopped",
-                            "auth_failed": "auth_failed",
-                            "error_burst": "error_burst"}.get(remote_state,
-                                                              remote_state)
-            break
+        # "waiting" means the worker hit the error brake and is sitting out
+        # resume_wait before carrying on. That is a LIVE job — treating it as a
+        # terminal state would abandon a send that is about to resume.
+        if remote_state in ("running", "waiting"):
+            ctl["state"] = remote_state
+            continue
+        ctl["state"] = {"done": "done", "stopped": "stopped",
+                        "auth_failed": "auth_failed",
+                        "failed": "failed",
+                        "error_burst": "error_burst"}.get(remote_state,
+                                                          remote_state)
+        break
     # The worker does not know our ledger, so record what it managed to send.
     for target in targets[:ctl["sent"]]:
         db.mark_sent(customer_id, aid, target, platform="rb")
@@ -470,6 +566,7 @@ async def _finish_send(customer_id, acc, ctl, owner_msg) -> None:
         "no_marker": "❌ پیام مارک‌شده پیدا نشد",
         "frozen": "⏸ سرویس ارسال موقتاً متوقف است",
         "failed": "⚠️ خطا",
+        "waiting": "⏳ در انتظار ادامه",
     }
     rows = [
         cards.kv("Phone", phone),
@@ -477,6 +574,12 @@ async def _finish_send(customer_id, acc, ctl, owner_msg) -> None:
         cards.kv("Failed", cards.num(ctl["failed"])),
         cards.kv("Result", labels.get(ctl["state"], ctl["state"])),
     ]
+    # Anything that did not simply finish has to carry its reason, otherwise the
+    # report says "⚠️ خطا" and nobody can tell what went wrong without SSH.
+    if ctl["state"] != "done":
+        reason = ctl.get("reason") or ctl.get("last_error") or ""
+        if reason:
+            rows.append(cards.kv("Reason", str(reason)[:180]))
     cust = db.get_customer(customer_id)
     await logbus.customer_action(cust, "send_finished", rows, platform="Rubika")
 
@@ -2003,14 +2106,36 @@ async def _channel_flow(customer_id, acc: dict, title: str, msg) -> None:
             # token login that never wrote a file, a rebuilt worker). The repair
             # writes the stored session onto the right server and retries once.
             if remote:
+                # The marker MUST go with this call: the worker forwards that
+                # marked post into the new channel as its first message. Without
+                # it every campaign produced an empty channel and then seeded
+                # hundreds of members into it.
                 async def _create_op():
                     return await worker.api_call(w, "POST", "/channel/create", {
                         "customer_id": customer_id, "phone": phone,
-                        "title": title}, timeout=180)
+                        "title": title, "marker": marker or ""}, timeout=240)
 
                 created = await session_store.run_with_repair(
                     customer_id, acc, _create_op)
                 guid = created.get("channel_guid")
+                if not guid:
+                    raise RuntimeError(
+                        "worker returned no channel_guid: "
+                        f"{str(created)[:160]}")
+                if marker and not created.get("forwarded"):
+                    # The channel exists, so this is not fatal — but it must not
+                    # pass silently, or the owner sees an empty channel and no
+                    # explanation anywhere.
+                    await logbus.event("⚠️ - #rb_channel_no_post", [
+                        cards.kv("Customer", customer_id),
+                        cards.kv("Phone", phone),
+                        cards.kv("Channel", guid),
+                        cards.kv("Marker", marker),
+                        cards.kv("MarkerFound",
+                                 "yes" if created.get("marker_found") else "no"),
+                        cards.kv("Error",
+                                 created.get("forward_error") or "-"),
+                    ])
                 await asyncio.sleep(config.CAMPAIGN_STEP_DELAY)
 
                 async def _add_op():
@@ -2031,15 +2156,46 @@ async def _channel_flow(customer_id, acc: dict, title: str, msg) -> None:
                 # Rubika rejects with INVALID_AUTH over a reused warm socket (the
                 # account may have JUST been sending). Each runs on its own fresh
                 # single-use connection — exactly what the reference does.
+                #
+                # Finding the marked post, creating the channel and forwarding
+                # that post into it all share ONE connection. Only create_channel
+                # used to run here, so the channel came out empty.
                 async def _create(client):
-                    return await rb.create_channel(client, title)
+                    message_id = None
+                    if marker:
+                        message_id = await rb.find_marked_message(client, marker)
+                    new_guid = await rb.create_channel(client, title)
+                    forwarded = False
+                    forward_error = ""
+                    if message_id and new_guid:
+                        saved_guid = await rb.get_self_guid(client)
+                        try:
+                            await rb.forward_message(client, saved_guid,
+                                                     new_guid, message_id)
+                            forwarded = True
+                        except Exception as exc:      # noqa: BLE001
+                            forward_error = (f"{type(exc).__name__}: "
+                                             f"{str(exc)[:160]}")
+                    return new_guid, bool(message_id), forwarded, forward_error
 
                 async def _create_op():
                     return await account_conn.fresh_call(
-                        customer_id, phone, _create, timeout=180)
+                        customer_id, phone, _create, timeout=240)
 
-                guid = await session_store.run_with_repair(
-                    customer_id, acc, _create_op)
+                guid, marker_found, forwarded, forward_error = \
+                    await session_store.run_with_repair(
+                        customer_id, acc, _create_op)
+                if not guid:
+                    raise RuntimeError("create_channel returned no guid")
+                if marker and not forwarded:
+                    await logbus.event("⚠️ - #rb_channel_no_post", [
+                        cards.kv("Customer", customer_id),
+                        cards.kv("Phone", phone),
+                        cards.kv("Channel", guid),
+                        cards.kv("Marker", marker),
+                        cards.kv("MarkerFound", "yes" if marker_found else "no"),
+                        cards.kv("Error", forward_error or "-"),
+                    ])
                 await asyncio.sleep(config.CAMPAIGN_STEP_DELAY)
 
                 async def _seed(client):
