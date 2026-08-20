@@ -796,6 +796,24 @@ async def worker_detail_cb(event):
     ]
     if detail:
         rows.append(cards.kv("Detail", str(detail)[:90]))
+    # Code version, and a loud warning when the worker is behind the master.
+    #
+    # A worker runs its OWN copy of the code, baked into its Docker image — a
+    # master update does NOT touch it. So a fix can be live on the master while a
+    # worker keeps running the old code, which is exactly how the login-disconnect
+    # fix reached the master but not the worker, and channel creation kept failing
+    # there. Surfacing the mismatch turns "why is only the worker broken" into one
+    # glance.
+    if not w.get("is_master"):
+        try:
+            wver = await worker.worker_code_version(w)
+            mver = worker.master_code_version()
+            rows.append(cards.kv("Code", wver))
+            if wver not in ("?", mver):
+                rows.append(f"⚠️ کد ورکر عقب‌تر از سرور است (سرور: {mver})")
+                rows.append("   «⬆️ آپدیت» را بزن تا ایمیج از نو با کد جدید ساخته شود.")
+        except Exception:      # noqa: BLE001
+            pass
     rows += [
         cards.LINE,
         cards.kv("Accounts", f"{stats['total']}  ({stats['healthy']} healthy, "

@@ -183,6 +183,14 @@ class SSHStepTimeout(TimeoutError):
     """A timeout that knows which step it belongs to."""
 
 
+class WorkerAPIError(RuntimeError):
+    """A worker endpoint returned an error, WITH the worker's own detail.
+
+    raise_for_status() reports only "400 Bad Request"; the reason the worker
+    actually failed lives in the response body, and this carries it through so the
+    log shows the real cause instead of a status line."""
+
+
 # "Step 3/12 : RUN pip install ..." — the legacy builder's progress line. This is
 # only available because DOCKER_BUILDKIT=0 is pinned; BuildKit prints nothing
 # comparable, so the earlier decision to stay on the legacy builder pays for
@@ -906,7 +914,23 @@ async def api_call(worker: dict, method: str, path: str, payload: dict = None,
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.request(method, url, json=payload,
                                         headers=headers)
-            resp.raise_for_status()
+            # Surface the WORKER's own error, not a bare "400 Bad Request".
+            #
+            # The worker returns HTTPException(400, detail="InvalidAuth: ...") when
+            # its own operation fails, but raise_for_status() throws away the body
+            # and reports only the status line — so the real cause (an
+            # INVALID_AUTH on the worker, a missing marker, whatever) never
+            # reached the log. Read the detail out of the body first.
+            if resp.status_code >= 400:
+                detail = ""
+                try:
+                    body = resp.json()
+                    detail = body.get("detail") if isinstance(body, dict) else body
+                except Exception:      # noqa: BLE001
+                    detail = (resp.text or "")[:300]
+                raise WorkerAPIError(
+                    f"ورکر {worker.get('tag', '?')} خطا داد "
+                    f"({resp.status_code}) روی {path}: {detail}")
             return resp.json()
     except Exception:
         # a broken tunnel is the usual cause -> drop it so the next call reopens
