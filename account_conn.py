@@ -154,6 +154,60 @@ async def connection(customer_id, phone: str):
             raise
 
 
+@asynccontextmanager
+async def fresh_connection(customer_id, phone: str):
+    """Yield a brand-new, single-use client for ONE signed operation.
+
+    This is the shape Rubika demands for the heavy signed calls — creating a
+    channel, adding members, forwarding the marked post, joining a group. Run
+    over a *reused* warm socket (the one an account has just been sending on),
+    the platform answers those calls with INVALID_AUTH; run on a fresh
+    connection they succeed. So we:
+
+      1) close any warm connection for this session (there must be exactly one
+         socket for the account — "ensure single connection"),
+      2) open a dedicated client and connect it,
+      3) hand it to the caller,
+      4) always disconnect it on the way out.
+
+    The fresh client is deliberately NOT stored in the warm-connection cache: it
+    lives only for this operation. The next warm ``call`` transparently opens a
+    new persistent connection. Callers must already hold the account's busy lock
+    so a second connection can never coexist with this one.
+    """
+    await close(customer_id, phone)
+    client = rb.open_client(rb.normalize_phone(phone), _cid(customer_id))
+    try:
+        await rb.connect_ready(client)
+        yield client
+    finally:
+        await _disconnect_quietly(client)
+
+
+async def fresh_call(customer_id, phone: str, fn, *args, timeout: float = None,
+                     **kwargs):
+    """Run one ``fn(client, ...)`` on a fresh single-use connection.
+
+    Same auth-confirmation contract as ``call``: an auth-looking failure is
+    verified on yet another fresh connection before InvalidAuthError is raised,
+    so a transient hiccup never wrongly quarantines a healthy account.
+    """
+    try:
+        async with fresh_connection(customer_id, phone) as client:
+            if timeout:
+                return await asyncio.wait_for(fn(client, *args, **kwargs),
+                                              timeout=timeout)
+            return await fn(client, *args, **kwargs)
+    except InvalidAuthError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        if is_auth_error(e) and await verify_session_dead(customer_id, phone):
+            await notify_invalid(customer_id, phone)
+            raise InvalidAuthError(
+                f"{_key(customer_id, phone)}: session invalid") from e
+        raise
+
+
 async def call(customer_id, phone: str, fn, *args, timeout: float = None,
                **kwargs):
     """Run one ``fn(client, ...)`` on the warm connection.

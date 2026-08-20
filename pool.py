@@ -309,6 +309,8 @@ async def _send_account(customer_id, job_id, acc: dict, ctl: dict) -> None:
 
     delay = config.clamp_delay(db.get_setting(customer_id, "send_delay"))
     sent = 0
+    failed = 0
+    last_error = ""
 
     async with busy.hold(key, "pool_send", customer_id=customer_id,
                          extra={"account_id": aid, "job_id": job_id}) as held:
@@ -358,15 +360,26 @@ async def _send_account(customer_id, job_id, acc: dict, ctl: dict) -> None:
                 db.pool_set_account(customer_id, job_id, aid, status="failed",
                                     note="session invalid")
                 return
-            except Exception:      # noqa: BLE001
-                pass
+            except Exception as exc:      # noqa: BLE001
+                # Record WHY instead of swallowing it. This is what left two
+                # accounts reading "done, sent 0" with no explanation: every
+                # send failed, each error was dropped on the floor, and the
+                # account finished looking healthy but silent.
+                failed += 1
+                last_error = f"{type(exc).__name__}: {str(exc)[:80]}"
             await asyncio.sleep(delay)
 
     db.usage_incr(customer_id, "send", sent)
     current = next((r for r in db.pool_accounts(customer_id, job_id)
                     if r["account_id"] == aid), None)
     if current and current["status"] not in _RETIRED | {"stopped"}:
-        db.pool_set_account(customer_id, job_id, aid, status="done")
+        if sent == 0 and failed:
+            # Found people but reached none of them -> surface the last reason
+            # rather than a cheerful "done".
+            db.pool_set_account(customer_id, job_id, aid, status="failed",
+                                note=last_error or "all sends failed")
+        else:
+            db.pool_set_account(customer_id, job_id, aid, status="done")
 
 
 # --------------------------------------------------------------------------- #

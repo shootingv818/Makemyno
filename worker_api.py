@@ -77,7 +77,8 @@ try:
         password: str
 
     class Prepare(Account):
-        marker: str
+        marker: str = ""
+        mode: str = "marker"           # "marker" | "text"
 
     class SendStart(Account):
         targets: list
@@ -340,16 +341,25 @@ def build_app():
         try:
             import account_conn
 
+            text_mode = (getattr(body, "mode", "marker") or "marker").lower() \
+                == "text"
+
+            # Fresh single connection, and read recipients regardless of the
+            # marker. The old code returned "marker not found" (and NO targets)
+            # whenever the account had no marked post, so a plain-text send —
+            # which needs no marker at all — reported "no contacts" on an
+            # account with hundreds of them. The marker is now advisory: text
+            # mode never looks for it, and marker mode reports whether it was
+            # found without hiding the recipient list.
             async def _work(client):
                 self_guid = await rb.get_self_guid(client)
-                message_id = await rb.find_marked_message(client, body.marker)
+                message_id = None if text_mode else \
+                    await rb.find_marked_message(client, body.marker)
                 recipients = await rb.get_ordered_recipients(client)
                 return self_guid, message_id, recipients
 
-            self_guid, message_id, recipients = await account_conn.call(
+            self_guid, message_id, recipients = await account_conn.fresh_call(
                 body.customer_id, body.phone, _work, timeout=180)
-            if not message_id:
-                return {"ok": False, "error": "marker not found"}
             # Plain guid strings over the wire. get_ordered_recipients yields
             # {"guid", "name"} dicts, and shipping those made the master str() a
             # dict into every send target.
@@ -357,7 +367,9 @@ def build_app():
                        for r in (recipients or [])
                        if (r.get("guid") if isinstance(r, dict) else r)]
             return {"ok": True, "from_guid": self_guid,
-                    "message_id": message_id, "targets": targets}
+                    "message_id": message_id,
+                    "marker_found": bool(message_id) or text_mode,
+                    "targets": targets}
         except Exception as exc:
             raise HTTPException(status_code=400,
                                 detail=f"{type(exc).__name__}: {str(exc)[:200]}")
@@ -474,12 +486,14 @@ def build_app():
         try:
             import account_conn
 
+            # Creating a channel is a signed call Rubika rejects with
+            # INVALID_AUTH over a reused warm socket -> fresh single connection.
             async def _work(client):
                 return await rb.create_channel(client, body.title,
                                                body.description)
 
-            guid = await account_conn.call(body.customer_id, body.phone, _work,
-                                           timeout=120)
+            guid = await account_conn.fresh_call(body.customer_id, body.phone,
+                                                 _work, timeout=120)
             return {"ok": True, "channel_guid": guid}
         except Exception as exc:
             raise HTTPException(status_code=400,
@@ -495,13 +509,14 @@ def build_app():
         try:
             import account_conn
 
+            # Adding members is signed too -> fresh single connection.
             async def _work(client):
                 return await rb.seed_channel_with_contacts(
                     client, body.channel_guid, target=body.target,
                     batch=body.batch, delay=body.delay)
 
-            added = await account_conn.call(body.customer_id, body.phone, _work,
-                                            timeout=1800)
+            added = await account_conn.fresh_call(body.customer_id, body.phone,
+                                                  _work, timeout=1800)
             return {"ok": True, "added": added}
         except Exception as exc:
             raise HTTPException(status_code=400,

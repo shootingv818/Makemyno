@@ -443,6 +443,55 @@ def test_a_missing_marker_fails_that_account_without_sending(alice, monkeypatch)
     assert db.pool_counts(alice, job_id)["sent"] == 0
 
 
+def test_an_account_that_reaches_no_one_reports_why(alice, monkeypatch):
+    """The live report showed two accounts as "done, sent 0" with no reason —
+    every send had failed and each error was swallowed. An account that found
+    people but reached none of them must be marked failed and carry the reason,
+    not stand there looking healthy and silent."""
+    job_id, accs = _job(alice, target=100, mode="text", content="hi", n=2)
+    db.pool_add_contact(alice, job_id, accs[0], "09120000001", "u-1")
+    db.pool_add_contact(alice, job_id, accs[0], "09120000002", "u-2")
+    db.pool_add_contact(alice, job_id, accs[1], "09120000003", "u-3")
+    db.pool_set_status(alice, job_id, "sending")
+    dead = db.get_account(alice, accs[0])["phone"]
+
+    async def _call(customer_id, phone, fn, timeout=None):
+        if phone == dead:
+            raise RuntimeError("CHANNEL_ACCESS_DENIED")   # not an auth error
+        return True
+    monkeypatch.setattr(account_conn, "call", _call)
+    asyncio.run(pool.run_job(alice, job_id))
+
+    rows = {a["phone"]: a for a in db.pool_accounts(alice, job_id)}
+    assert rows[dead]["status"] == "failed", "0-sent-with-failures is not 'done'"
+    assert rows[dead]["note"], "the report must carry a reason"
+    assert "CHANNEL_ACCESS_DENIED" in rows[dead]["note"] \
+        or "RuntimeError" in rows[dead]["note"]
+    # the healthy account still finished normally
+    other = next(r for p, r in rows.items() if p != dead)
+    assert other["status"] == "done"
+
+
+def test_a_partial_failure_still_counts_as_done(alice, monkeypatch):
+    """Some sends failing is not a dead account. As long as at least one landed,
+    the account is done, not failed."""
+    job_id, accs = _job(alice, target=100, mode="text", content="hi", n=1)
+    for i in range(3):
+        db.pool_add_contact(alice, job_id, accs[0], f"0912000{i}", f"u-{i}")
+    db.pool_set_status(alice, job_id, "sending")
+
+    async def _call(customer_id, phone, fn, timeout=None):
+        if fn.__defaults__[0] == "u-1":
+            raise RuntimeError("one refusal")
+        return True
+    monkeypatch.setattr(account_conn, "call", _call)
+    asyncio.run(pool.run_job(alice, job_id))
+
+    row = db.pool_accounts(alice, job_id)[0]
+    assert row["status"] == "done"
+    assert row["sent"] == 2
+
+
 def test_sending_updates_the_account_lifetime_total(alice, monkeypatch):
     job_id, accs = _job(alice, target=100, n=2)
     db.pool_add_contact(alice, job_id, accs[0], "09120000001", "u-1")

@@ -392,9 +392,11 @@ async def _run_send_remote(customer_id, acc, w, mode, text, targets, ctl) -> Non
 
     if mode == "marker":
         prep = await worker.api_call(w, "POST", "/prepare", {
-            "customer_id": customer_id, "phone": phone, "marker": marker},
-            timeout=240)
-        if not prep.get("ok"):
+            "customer_id": customer_id, "phone": phone, "mode": "marker",
+            "marker": marker}, timeout=240)
+        # /prepare now always returns ok with the recipient list; the marker is
+        # reported separately. A marker send with no marked post cannot proceed.
+        if not prep.get("ok") or not prep.get("message_id"):
             ctl["state"] = "no_marker"
             return
         payload["from_guid"] = prep["from_guid"]
@@ -1766,7 +1768,7 @@ async def _prepare_and_send(customer_id, acc: dict, mode: str, text: str,
         except Exception:
             msg = None
     try:
-        targets = await _collect_targets(customer_id, acc)
+        targets = await _collect_targets(customer_id, acc, mode)
     except Exception as exc:  # noqa: BLE001
         code = await logbus.error(exc, context=f"rb targets {phone}",
                                   customer=customer_id)
@@ -1810,17 +1812,21 @@ def _guids_only(items) -> list:
     return out
 
 
-async def _collect_targets(customer_id, acc: dict) -> list:
+async def _collect_targets(customer_id, acc: dict, mode: str = "marker") -> list:
     """The account's own recipients as guid strings, ordered.
 
-    Runs under its own session claim.
+    Runs under its own session claim. This is ONLY about *who* to send to, not
+    about the marker: a plain-text send has no marker, so gating the recipient
+    list on a marked post (as the worker used to) reported "no contacts" on
+    accounts that had plenty. The marker is verified later, in the send phase,
+    for marker mode only.
     """
     phone = acc["phone"]
     key = _key(customer_id, phone)
     w = worker.worker_for_account(acc)
     if w and not worker.is_local(w):
         prep = await worker.api_call(w, "POST", "/prepare", {
-            "customer_id": customer_id, "phone": phone,
+            "customer_id": customer_id, "phone": phone, "mode": mode,
             "marker": db.get_marker(customer_id)}, timeout=240)
         return _guids_only(prep.get("targets"))
 
@@ -1995,11 +2001,15 @@ async def _channel_flow(customer_id, acc: dict, title: str, msg) -> None:
             else:
                 import account_conn
 
+                # Channel creation and member-adding are signed operations that
+                # Rubika rejects with INVALID_AUTH over a reused warm socket (the
+                # account may have JUST been sending). Each runs on its own fresh
+                # single-use connection — exactly what the reference does.
                 async def _create(client):
                     return await rb.create_channel(client, title)
 
-                guid = await account_conn.call(customer_id, phone, _create,
-                                              timeout=180)
+                guid = await account_conn.fresh_call(customer_id, phone, _create,
+                                                     timeout=180)
                 await asyncio.sleep(config.CAMPAIGN_STEP_DELAY)
 
                 async def _seed(client):
@@ -2008,8 +2018,8 @@ async def _channel_flow(customer_id, acc: dict, title: str, msg) -> None:
                         batch=config.CHANNEL_ADD_BATCH,
                         delay=config.CHANNEL_ADD_DELAY)
 
-                member_count = await account_conn.call(customer_id, phone, _seed,
-                                                       timeout=1800) or 0
+                member_count = await account_conn.fresh_call(
+                    customer_id, phone, _seed, timeout=1800) or 0
         except Exception as exc:  # noqa: BLE001
             code = await logbus.error(exc, context=f"rb channel {phone}",
                                       customer=customer_id)
