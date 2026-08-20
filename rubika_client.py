@@ -702,8 +702,35 @@ def _msg_id_of(msg):
     return _get(msg, "message_id", "id")
 
 
+# Why the last marker search found nothing, for the card the customer sees.
+# "marker not found" with no numbers is unactionable: it cannot tell apart an
+# empty Saved chat, a search that stopped after one page, and a marker that
+# genuinely is not there.
+_LAST_MARKER_SCAN: dict = {"scanned": 0, "marker": "", "error": ""}
+
+
+def last_marker_scan() -> dict:
+    return dict(_LAST_MARKER_SCAN)
+
+
 def _msg_text_of(msg):
-    return _get(msg, "text", "caption") or ""
+    """The searchable text of a message, INCLUDING a media caption.
+
+    A plain `text`/`caption` lookup misses the common case: the advert is a photo
+    or a file, and some builds carry its caption on the attachment rather than on
+    the message. The marker then never matched, on a post that visibly had it.
+    """
+    direct = _get(msg, "text", "caption")
+    if direct:
+        return direct
+    for holder in ("file_inline", "file", "attachment", "media"):
+        nested = _get(msg, holder)
+        if nested is None:
+            continue
+        found = _get(nested, "caption", "text", "file_name")
+        if found:
+            return found
+    return ""
 
 
 async def get_self_guid(client: Client) -> str:
@@ -729,23 +756,34 @@ async def find_marked_message(client: Client, marker: str):
     The guid half was redundant anyway: every caller already fetches it with
     get_self_guid in the same breath.
     """
+    marker = (marker or "").strip()
+    if not marker:
+        return None
     saved_guid = await get_self_guid(client)
-    max_id = None
+    max_id = "0"
+    seen_ids = set()
+    scanned = 0
+    last_error = ""
     for _ in range(50):  # up to ~50 pages of recent saved messages
         try:
-            if max_id:
-                result = await client.get_messages(saved_guid, max_id, "20")
-            else:
-                result = await client.get_messages(saved_guid, "0", "20")
+            # max_id MUST be a str. rubpy declares get_messages(object_guid,
+            # max_id: str, limit: str) and the platform rejects an int outright.
+            # The first page passed the literal "0" and worked; every later page
+            # passed _msg_id_of(...) straight through, which is an int, so page 2
+            # errored and the bare `except: break` below ended the search. Only
+            # the newest 20 messages were ever examined, and any account whose
+            # marked post sat further back reported "marker not found" while the
+            # marker was plainly there.
+            result = await client.get_messages(saved_guid, str(max_id), "20")
         except Exception as exc:      # noqa: BLE001
-            # An AUTH failure must NOT be swallowed. This bare `except: break` is
-            # what hid a dead session for hours: reading Saved returned None as
-            # though the marker simply did not exist, the flow carried on, and the
-            # first error anyone ever saw was INVALID_AUTH from addChannel — so the
-            # channel code was blamed for a session problem. A paging hiccup still
-            # just stops paging; a session problem is reported.
+            # An AUTH failure must NOT be swallowed. A bare `except: break` here
+            # once hid a dead session for hours: reading Saved returned None as
+            # though the marker simply did not exist, and the first error anyone
+            # saw was INVALID_AUTH from addChannel, so the channel code was blamed
+            # for a session problem.
             if is_auth_failure(exc):
                 raise
+            last_error = f"{type(exc).__name__}: {str(exc)[:120]}"
             break
         messages = getattr(result, "messages", None)
         if messages is None and isinstance(result, dict):
@@ -753,12 +791,19 @@ async def find_marked_message(client: Client, marker: str):
         if not messages:
             break
         for msg in messages:
+            scanned += 1
             if marker in _msg_text_of(msg):
                 return _msg_id_of(msg)
-        last = messages[-1]
-        max_id = _msg_id_of(last)
-        if not max_id:
+        next_id = _msg_id_of(messages[-1])
+        # Stop if the platform hands back a page we have already walked. Without
+        # this a server that ignores max_id turns the loop into 50 rescans of the
+        # same 20 messages and reports "not found" after a long silence.
+        if not next_id or str(next_id) in seen_ids:
             break
+        seen_ids.add(str(next_id))
+        max_id = next_id
+    _LAST_MARKER_SCAN.update({"scanned": scanned, "marker": marker,
+                              "error": last_error})
     return None
 
 

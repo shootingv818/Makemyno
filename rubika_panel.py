@@ -324,6 +324,34 @@ async def _run_send(customer_id, acc: dict, mode: str, text: str,
     await _finish_send(customer_id, acc, ctl, owner_msg)
 
 
+def _demote_empty_result(ctl: dict) -> dict:
+    """A run that reached NOBODY is not a finish, whatever the path reported.
+
+    _finish_send is the single choke point every send arrives at — local, remote
+    and multi-account — so the rule lives here once instead of being
+    re-implemented in each loop and forgotten in one of them. It already was
+    forgotten: a multi-account send with 34 targets reported "🏁 پایان" with Sent 0
+    and Failed 0, which tells the customer their advert went out when nothing ever
+    ran.
+
+    A separate function, and returning ctl, so the rule can be asserted directly
+    rather than by searching the source of a coroutine that also talks to Telegram.
+    """
+    if ctl.get("state") != "done":
+        return ctl
+    if not int(ctl.get("total") or 0):
+        return ctl                      # nothing to send is not a failure
+    if int(ctl.get("sent") or 0):
+        return ctl
+    ctl["state"] = "failed"
+    if not ctl.get("reason"):
+        ctl["reason"] = (
+            ctl.get("last_error")
+            or f"0 of {ctl['total']} targets were reached and nothing failed "
+               "either — the send loop never ran")
+    return ctl
+
+
 async def _ctl_sleep(ctl, seconds: float, step: float = 2.0) -> None:
     """Sleep, but wake up as soon as the job is stopped.
 
@@ -396,8 +424,17 @@ async def _run_send_local(customer_id, acc, mode, text, targets, ctl,
                 # actually works. It used to receive a 2-tuple, which is truthy
                 # even when the marker was missing, and then derived a None id.
                 if not message_id:
+                    # Say how far the search actually got. "marker not found"
+                    # alone cannot tell an empty Saved chat from a search that
+                    # stopped after one page from a marker that truly is absent,
+                    # and those need different answers from the customer.
+                    scan = rb.last_marker_scan()
                     ctl["state"] = "no_marker"
-                    ctl["reason"] = f"no saved message tagged «{marker}»"
+                    ctl["reason"] = (
+                        f"no saved message contains «{marker}» "
+                        f"(scanned {scan.get('scanned', 0)} messages"
+                        + (f", stopped on {scan['error']}" if scan.get("error")
+                           else "") + ")")
                     return
 
             while idx < total:
@@ -568,6 +605,8 @@ async def _finish_send(customer_id, acc, ctl, owner_msg) -> None:
     w = worker.worker_for_account(acc)
     if w:
         db.incr_worker_sent(w["id"], ctl["sent"])
+
+    _demote_empty_result(ctl)
 
     labels = {
         "done": "🏁 پایان",
@@ -2258,18 +2297,48 @@ async def _channel_flow(customer_id, acc: dict, title: str, msg) -> None:
 # Wizard steps
 # --------------------------------------------------------------------------- #
 def _normalize_phone_input(text: str) -> str:
+    """A phone number, or "" when the input is not one.
+
+    There used to be no UPPER bound: any input with ten or more digits was
+    accepted. So a session token pasted at the phone prompt had its punctuation
+    stripped and the remaining two hundred digits were sent to Rubika as a phone
+    number, which answered INVALID_INPUT and logged an error whose "Where" field
+    was the whole token. A number is at most 13 digits, so the bound is real, not
+    a guess.
+    """
     digits = "".join(ch for ch in (text or "") if ch.isdigit())
+    if digits.startswith("0098"):
+        digits = digits[4:]
     if digits.startswith("98") and len(digits) >= 12:
         digits = "0" + digits[2:]
     if len(digits) == 10 and not digits.startswith("0"):
         digits = "0" + digits
-    return digits if len(digits) >= 10 else ""
+    if not 10 <= len(digits) <= 13:
+        return ""
+    return digits
+
+
+def _looks_like_session_token(text: str) -> bool:
+    """Did the customer paste a session token where a phone was asked for?
+
+    Worth detecting on purpose: the two are asked for in almost the same place,
+    and "شماره خوانده نشد" for a perfectly good token sends people in circles.
+    """
+    raw = (text or "").strip()
+    return raw.upper().startswith("MMSESS:") or len(raw) > 40
 
 
 async def _step_phone(event, st):
     uid = event.sender_id
     phone = _normalize_phone_input(event.raw_text)
     if not phone:
+        if _looks_like_session_token(event.raw_text):
+            await _respond(event, cards.card("این یک توکن سشن است، نه شماره", [
+                "برای ورود با توکن، از لیست اکانت‌ها گزینهٔ ورود با توکن سشن را "
+                "بزن و توکن را همان‌جا بفرست.",
+                "اینجا فقط شمارهٔ موبایل لازم است، مثل 09123456789.",
+            ]), buttons=[_back(b"rb")])
+            return
         await _respond(event, "شماره خوانده نشد. با کد کشور بفرست، مثل 09123456789.")
         return
     if db.get_account_by_phone(uid, phone):

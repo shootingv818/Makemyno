@@ -1370,7 +1370,16 @@ def get_bool_setting(customer_id, key: str, default: bool = False) -> bool:
 
 # convenience wrappers used all over the panels
 def get_marker(customer_id) -> str:
-    return get_setting(customer_id, "rb_marker") or config.FORWARD_MARKER
+    """The customer's marker, ALWAYS stripped.
+
+    The reference strips on both write and read; this only stripped on write, so
+    any row written by an older build (or by any path that is not the text setter)
+    kept its trailing newline. `"هسهسه\\n" in "هسهسه"` is False, so the marker was
+    reported missing on a post that plainly carried it. Stripping on read repairs
+    those rows without a migration.
+    """
+    marker = get_setting(customer_id, "rb_marker") or config.FORWARD_MARKER
+    return str(marker).strip()
 
 
 def get_delay(customer_id) -> float:
