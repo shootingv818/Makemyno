@@ -238,6 +238,26 @@ async def finish_login(ctx: dict, code: str):
     except Exception:      # noqa: BLE001
         pass
 
+    # DISCONNECT THE LOGIN CLIENT before returning. This one line is why every
+    # post-login operation was failing.
+    #
+    #   * Rubika allows ONE live connection per session. If this client stays
+    #     connected, the next call (send / channel / contacts) opens a SECOND
+    #     connection on the same session and Rubika answers AUTH_FROM_ANOTHER ->
+    #     INVALID_AUTH — exactly what channel creation hit on master and worker.
+    #   * rubpy commits its session store on disconnect(). Never closing can leave
+    #     the file uncommitted, so a reopened client reads no auth and connects
+    #     unauthenticated — which is why "get contacts" came back empty on an
+    #     account that plainly has contacts.
+    #
+    # Everything the caller needs (session_values, name, guid, contacts) is
+    # already captured above, so closing here loses nothing. The reference project
+    # disconnects at this same point for the same reason.
+    try:
+        await client.disconnect()
+    except Exception:      # noqa: BLE001
+        pass
+
     return {
         "guid": guid,
         "name": name,
