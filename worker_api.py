@@ -753,8 +753,8 @@ def build_app():
                 return guid, bool(message_id), forwarded, forward_error
 
             guid, marker_found, forwarded, forward_error = \
-                await account_conn.fresh_call(body.customer_id, body.phone,
-                                              _work, timeout=180)
+                await account_conn.signed_call(body.customer_id, body.phone,
+                                               _work, timeout=180)
             return {"ok": True, "channel_guid": guid,
                     "marker_found": marker_found, "forwarded": forwarded,
                     "forward_error": forward_error}
@@ -778,8 +778,8 @@ def build_app():
                     client, body.channel_guid, target=body.target,
                     batch=body.batch, delay=body.delay)
 
-            added = await account_conn.fresh_call(body.customer_id, body.phone,
-                                                  _work, timeout=1800)
+            added = await account_conn.signed_call(body.customer_id, body.phone,
+                                                   _work, timeout=1800)
             return {"ok": True, "added": added}
         except Exception as exc:
             raise HTTPException(status_code=400,

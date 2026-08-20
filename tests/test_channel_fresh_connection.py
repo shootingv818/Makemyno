@@ -149,20 +149,145 @@ def _endpoint(body, name):
     return tail[:end if end != -1 else len(tail)]
 
 
-def test_worker_channel_create_uses_a_fresh_connection():
+# CORRECTION, after channel creation kept failing with INVALID_AUTH on every
+# server even with the fresh-connection rule in place.
+#
+# The three tests below used to demand `fresh_call`, and that requirement was
+# built on half of the reference. The reference has TWO shapes: its older
+# /channel/create closes the warm socket and opens a dedicated client, while its
+# actively used /gen/create and /broadcast/run — the ones group_panel drives —
+# call rb.create_channel straight over the WARM connection. Only the first was
+# read, and the conclusion "signed calls need a fresh socket" was generalised
+# from it.
+#
+# What actually broke it was the CHURN, not which socket. fresh_connection closed
+# the warm socket and reopened within milliseconds, and config.py has warned all
+# along that "even a fast SEQUENTIAL reconnect on the same session can be treated
+# as a conflict". Rubika saw the conflict and refused the first signed call.
+#
+# So the contract is now: go over the warm connection first, like the reference's
+# live paths, fall back to a dedicated one, and NEVER reopen without settling.
+def test_worker_channel_create_uses_the_signed_call_path():
     body = _src("worker_api.py")
     section = _endpoint(body, "channel/create")
-    assert "fresh_call" in section, \
-        "channel creation must run on a fresh connection, not the warm one"
-    assert "account_conn.call(" not in section, \
-        "the warm-socket call is exactly what returned INVALID_AUTH"
+    assert "signed_call" in section, \
+        ("channel creation must go through account_conn.signed_call, which tries "
+         "the warm connection first like the reference's /gen/create")
+    assert "fresh_call(" not in section, \
+        ("fresh_call closes and instantly reopens the session; that churn is what "
+         "answered addChannel with INVALID_AUTH")
 
 
-def test_worker_channel_add_uses_a_fresh_connection():
+def test_worker_channel_add_uses_the_signed_call_path():
     body = _src("worker_api.py")
     section = _endpoint(body, "channel/add")
-    assert "fresh_call" in section
-    assert "account_conn.call(" not in section
+    assert "signed_call" in section
+    assert "fresh_call(" not in section
+
+
+def test_signed_call_tries_warm_then_fresh():
+    """The order matters: warm first is the reference's live behaviour."""
+    src = _src("account_conn.py")
+    start = src.index("async def signed_call")
+    body = src[start:]
+    nxt = body.find("\nasync def ", 10)
+    body = _code_only(body[:nxt if nxt != -1 else len(body)])
+    warm_at = body.index("call(customer_id, phone, fn")
+    fresh_at = body.index("fresh_connection(customer_id, phone)")
+    assert warm_at < fresh_at, \
+        "signed_call must attempt the warm connection BEFORE the dedicated one"
+    assert "is_auth_error" in body, \
+        "only an auth-shaped failure may trigger the second attempt"
+
+
+# --------------------------------------------------------------------------- #
+# The real defect: reopening a session without waiting out the settle delay
+# --------------------------------------------------------------------------- #
+def _code_only(text: str) -> str:
+    """Strip comments and docstrings.
+
+    Needed because these checks name the very symbols they guard, in the comment
+    that explains the fix. Removing the real `_settle_after_close(...)` call left
+    the words "See _settle_after_close" behind in a comment and this test stayed
+    green — the same trap test_reference_audit documents.
+    """
+    out = []
+    in_doc = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(('"""', "'''")):
+            ticks = stripped[:3]
+            if not in_doc:
+                in_doc = not (stripped.endswith(ticks) and len(stripped) > 3)
+                continue
+            in_doc = False
+            continue
+        if in_doc or stripped.startswith("#"):
+            continue
+        out.append(line.split("#")[0])
+    return "\n".join(out)
+
+
+def test_fresh_connection_settles_before_reopening():
+    src = _src("account_conn.py")
+    start = src.index("async def fresh_connection")
+    body = src[start:]
+    nxt = body.find("\nasync def ", 10)
+    body = _code_only(body[:nxt if nxt != -1 else len(body)])
+    close_at = body.index("close(customer_id, phone)")
+    settle_at = body.index("_settle_after_close")
+    open_at = body.index("rb.open_client")
+    assert close_at < settle_at < open_at, \
+        ("fresh_connection must wait AFTER closing the warm socket and BEFORE "
+         "opening a new one — reopening in the same breath is the conflict that "
+         "made addChannel return INVALID_AUTH")
+
+
+def test_verify_session_dead_settles_before_probing():
+    src = _src("account_conn.py")
+    start = src.index("async def verify_session_dead")
+    body = src[start:]
+    nxt = body.find("\nasync def ", 10)
+    body = _code_only(body[:nxt if nxt != -1 else len(body)])
+    assert "_settle_after_close" in body, \
+        ("probing on a socket opened straight after a close is itself a conflict, "
+         "so the probe would report a healthy session as dead")
+
+
+def test_settle_is_skipped_when_nothing_was_open():
+    """An account with no warm socket must not pay the delay for nothing."""
+    import asyncio as _asyncio
+    import time as _time
+
+    started = _time.monotonic()
+    _asyncio.run(account_conn._settle_after_close(False))
+    assert (_time.monotonic() - started) < 0.5
+
+
+def test_settle_actually_waits_when_a_socket_was_closed(monkeypatch):
+    import asyncio as _asyncio
+
+    slept = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(account_conn.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(account_conn.config, "SESSION_SETTLE_SEC", 5.0)
+    _asyncio.run(account_conn._settle_after_close(True))
+    assert slept == [5.0], \
+        "a real close must be followed by the full settle delay"
+
+
+def test_close_reports_whether_a_live_socket_was_closed():
+    """The settle decision depends on this being truthful."""
+    import asyncio as _asyncio
+
+    async def _go():
+        # nothing cached for this session -> nothing was closed
+        assert await account_conn.close(4242, "989120000099") is False
+
+    _asyncio.run(_go())
 
 
 def test_worker_prepare_uses_a_fresh_connection():
@@ -185,11 +310,13 @@ def _function_body(body: str, header: str) -> str:
     return header + rest[:end]
 
 
-def test_the_panel_channel_flow_uses_a_fresh_connection():
+def test_the_panel_channel_flow_uses_the_signed_call_path():
     body = _src("rubika_panel.py")
     section = _function_body(body, "async def _channel_flow")
-    assert "fresh_call" in section, \
-        "the local channel path must use a fresh connection too"
+    assert "signed_call" in section, \
+        "the local channel path must use the same warm-first shape"
+    assert "fresh_call(" not in section, \
+        "the local path must not churn the session either"
 
 
 # --------------------------------------------------------------------------- #

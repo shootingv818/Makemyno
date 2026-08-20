@@ -175,13 +175,57 @@ async def fresh_connection(customer_id, phone: str):
     new persistent connection. Callers must already hold the account's busy lock
     so a second connection can never coexist with this one.
     """
-    await close(customer_id, phone)
+    was_live = await close(customer_id, phone)
+    # Never reopen in the same breath as the close. See _settle_after_close.
+    await _settle_after_close(was_live)
     client = rb.open_client(rb.normalize_phone(phone), _cid(customer_id))
     try:
         await rb.connect_ready(client)
         yield client
     finally:
         await _disconnect_quietly(client)
+
+
+async def signed_call(customer_id, phone: str, fn, *args, timeout: float = None,
+                      **kwargs):
+    """Run one signed operation the way the reference's LIVE paths run it.
+
+    The reference has two shapes for creating a channel, and this repo copied the
+    wrong one. Its older /channel/create closes the warm socket and opens a
+    dedicated client; its actively used /gen/create and /broadcast/run — the ones
+    group_panel drives — call rb.create_channel straight over the WARM,
+    persistent connection through account_conn.call. Its own module docstring
+    says why: "we do NOT connect/disconnect per message — that rapid churn is
+    what makes Rubika treat the activity as suspicious and revoke the session."
+
+    So: try the warm connection first, exactly like /gen/create. Only if that
+    fails in an auth-shaped way do we settle and try once on a dedicated
+    connection, which keeps the old behaviour available instead of betting
+    everything on one theory. Whichever wins is visible in the logs.
+    """
+    try:
+        return await call(customer_id, phone, fn, *args, timeout=timeout,
+                          **kwargs)
+    except InvalidAuthError:
+        raise
+    except Exception as warm_error:      # noqa: BLE001
+        if not is_auth_error(warm_error):
+            raise
+        try:
+            async with fresh_connection(customer_id, phone) as client:
+                if timeout:
+                    return await asyncio.wait_for(fn(client, *args, **kwargs),
+                                                  timeout=timeout)
+                return await fn(client, *args, **kwargs)
+        except Exception as fresh_error:      # noqa: BLE001
+            # Both shapes failed. Report the pair, because "which connection
+            # shape did we use" is the single most useful fact for this class of
+            # bug and it must not be lost.
+            raise RuntimeError(
+                f"signed call failed on both connections; "
+                f"warm={type(warm_error).__name__}: {str(warm_error)[:120]} | "
+                f"fresh={type(fresh_error).__name__}: {str(fresh_error)[:120]}"
+            ) from fresh_error
 
 
 async def fresh_call(customer_id, phone: str, fn, *args, timeout: float = None,
@@ -246,7 +290,12 @@ async def verify_session_dead(customer_id, phone: str) -> bool:
     """
     c = _get_conn(customer_id, phone)
     async with c.lock:
+        was_live = c.client is not None
         await _drop(c)                        # ditch the suspect connection
+        # Same trap as fresh_connection: probing on a socket opened immediately
+        # after a close is itself a conflict, so the probe would report a healthy
+        # session as dead and quarantine the account.
+        await _settle_after_close(was_live)
         client = None
         try:
             client = rb.open_client(c.phone, c.customer_id)
@@ -276,18 +325,52 @@ async def notify_invalid(customer_id, phone: str):
         pass
 
 
-async def close(customer_id, phone: str):
+async def close(customer_id, phone: str) -> bool:
     """Force-close a session's warm connection.
 
     Call this before a fresh login, and before anything that opens its own
     client, so a second connection can never coexist for one session.
+
+    Returns True when a LIVE socket was actually closed. Callers that are about
+    to reopen need to know, because reopening straight after a real close is what
+    Rubika treats as a conflict — see _settle_after_close.
     """
     c = _conns.get(_key(customer_id, phone))
     if not c:
-        return
+        return False
     async with c.lock:
+        was_live = c.client is not None
         await _drop(c)
         c.invalid = False
+        return was_live
+
+
+async def _settle_after_close(was_live: bool) -> None:
+    """Wait out the settle delay before reopening a session we just closed.
+
+    This missing wait is what broke channel creation, member-adding and prepare
+    on every server at once.
+
+    config.py has said it all along: "even a fast SEQUENTIAL reconnect on the same
+    session can be treated as a conflict, so we always wait after closing before
+    opening again." fresh_connection closed the warm socket and reopened within
+    milliseconds — zero wait — so Rubika saw a conflict and answered the first
+    signed call (addChannel) with INVALID_AUTH. Reads still worked, which is why
+    it looked like a channel bug rather than a connection bug.
+
+    It compounded: the failure sent fresh_call into verify_session_dead, another
+    instant reconnect, and session_store.run_with_repair then retried the whole
+    thing. One "create channel" tap opened four connections to one session inside
+    a few seconds.
+
+    Only waited when something was really closed, so an account with no warm
+    socket does not pay five seconds for nothing.
+    """
+    if not was_live:
+        return
+    delay = float(getattr(config, "SESSION_SETTLE_SEC", 0) or 0)
+    if delay > 0:
+        await asyncio.sleep(delay)
 
 
 async def close_all():

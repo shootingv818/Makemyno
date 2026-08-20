@@ -2179,7 +2179,7 @@ async def _channel_flow(customer_id, acc: dict, title: str, msg) -> None:
                     return new_guid, bool(message_id), forwarded, forward_error
 
                 async def _create_op():
-                    return await account_conn.fresh_call(
+                    return await account_conn.signed_call(
                         customer_id, phone, _create, timeout=240)
 
                 guid, marker_found, forwarded, forward_error = \
@@ -2205,7 +2205,7 @@ async def _channel_flow(customer_id, acc: dict, title: str, msg) -> None:
                         delay=config.CHANNEL_ADD_DELAY)
 
                 async def _seed_op():
-                    return await account_conn.fresh_call(
+                    return await account_conn.signed_call(
                         customer_id, phone, _seed, timeout=1800)
 
                 member_count = await session_store.run_with_repair(
