@@ -38,6 +38,24 @@ def _src(name):
         return fh.read()
 
 
+def _function_body(body: str, header: str) -> str:
+    """One whole top-level function, from its `def` to the next top-level one.
+
+    A fixed byte window was used here before, and it silently stopped covering
+    the function as soon as the code grew — reporting a missing normalisation
+    that was in fact three lines below the cut. The window now ends where the
+    function does.
+    """
+    start = body.index(header)
+    rest = body[start + len(header):]
+    end = len(rest)
+    for marker in ("\nasync def ", "\ndef ", "\nclass "):
+        at = rest.find(marker)
+        if at != -1:
+            end = min(end, at)
+    return header + rest[:end]
+
+
 def _code(name):
     """Source with comments stripped.
 
@@ -173,8 +191,7 @@ def test_send_targets_are_normalised_to_strings():
     payload does str(t). The send loop was handing whole dicts to send_text."""
     body = _src("rubika_panel.py")
     assert "def _guids_only" in body
-    start = body.index("async def _collect_targets")
-    section = body[start:start + 2000]
+    section = _function_body(body, "async def _collect_targets")
     assert "_guids_only" in section, "both paths must normalise"
     assert section.count("_guids_only") >= 2, "local AND remote paths"
 

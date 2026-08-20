@@ -1079,6 +1079,30 @@ async def pick_worker_for_login(verify: bool = True, exclude_id=None) -> dict | 
     return pool[db.fleet_rr_next(len(pool))]
 
 
+async def push_session(worker: dict, customer_id, phone: str,
+                       values: dict, timeout: int = 60) -> bool:
+    """WRITE a stored session onto one remote worker. Best-effort, never raises.
+
+    Used to place an account's session on the server that is about to run its
+    work, and to repair a worker whose session file is missing — the state that
+    made every signed call there answer INVALID_AUTH.
+    """
+    if not values or not values.get("auth"):
+        return False
+    try:
+        res = await api_call(worker, "POST", "/session/import", {
+            "customer_id": customer_id,
+            "phone": phone,
+            "auth": values.get("auth"),
+            "private_key": values.get("private_key"),
+            "guid": values.get("guid"),
+            "user_agent": values.get("user_agent"),
+        }, timeout=timeout)
+        return bool(res.get("ok"))
+    except Exception:      # noqa: BLE001
+        return False
+
+
 def worker_for_account(account: dict) -> dict | None:
     """The worker that owns an account (session affinity).
 

@@ -89,6 +89,12 @@ try:
         delay: float = 1.0
         max_errors: int = 5
 
+    class SessionImport(Account):
+        auth: str | None = None
+        private_key: str | None = None
+        guid: str | None = None
+        user_agent: str | None = None
+
     class ChannelCreate(Account):
         title: str
         description: str | None = None
@@ -332,6 +338,42 @@ def build_app():
                     "reason": f"check failed: {type(exc).__name__}"}
         finally:
             _release(key, "verify")
+
+    # ---- portable session import ------------------------------------------ #
+    @app.post("/session/import")
+    async def session_import(body: SessionImport,
+                             authorization: str = Header(None)):
+        """WRITE a session onto this worker's store. Never connects.
+
+        This is what lets an account run on a worker without a fresh SMS code,
+        and — more importantly in practice — what REPAIRS a worker that is
+        missing the session file for an account the master thinks lives here.
+        Without it, the worker connected unauthenticated and answered every
+        signed call with INVALID_AUTH.
+
+        session.insert() only writes the file, so there is no second live
+        connection and no AUTH_FROM_ANOTHER risk. Any warm connection is closed
+        first so nothing is fighting over the file.
+        """
+        _auth(authorization)
+        if not body.auth:
+            return {"ok": False, "error": "missing auth"}
+        try:
+            import account_conn
+            try:
+                await account_conn.close(body.customer_id, body.phone)
+            except Exception:      # noqa: BLE001
+                pass
+            wrote = rb.import_session(body.phone, body.customer_id, {
+                "auth": body.auth,
+                "private_key": body.private_key,
+                "guid": body.guid,
+                "user_agent": body.user_agent,
+                "phone": body.phone,
+            })
+            return {"ok": bool(wrote)}
+        except Exception as exc:      # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
 
     # ---- prepare a marked message ---------------------------------------- #
     @app.post("/prepare")

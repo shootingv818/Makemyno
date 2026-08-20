@@ -1823,11 +1823,18 @@ async def _collect_targets(customer_id, acc: dict, mode: str = "marker") -> list
     """
     phone = acc["phone"]
     key = _key(customer_id, phone)
+    import session_store
     w = worker.worker_for_account(acc)
     if w and not worker.is_local(w):
-        prep = await worker.api_call(w, "POST", "/prepare", {
-            "customer_id": customer_id, "phone": phone, "mode": mode,
-            "marker": db.get_marker(customer_id)}, timeout=240)
+        async def _prep_op():
+            return await worker.api_call(w, "POST", "/prepare", {
+                "customer_id": customer_id, "phone": phone, "mode": mode,
+                "marker": db.get_marker(customer_id)}, timeout=240)
+
+        # A worker with no session file for this account reads ZERO contacts
+        # rather than failing, so the repair path matters here as much as it does
+        # for channels: it is the same missing session, one symptom later.
+        prep = await session_store.run_with_repair(customer_id, acc, _prep_op)
         return _guids_only(prep.get("targets"))
 
     import account_conn
@@ -1839,7 +1846,10 @@ async def _collect_targets(customer_id, acc: dict, mode: str = "marker") -> list
         async def _work(client):
             return await rb.get_ordered_recipients(client)
 
-        got = await account_conn.call(customer_id, phone, _work, timeout=300)
+        async def _work_op():
+            return await account_conn.call(customer_id, phone, _work, timeout=300)
+
+        got = await session_store.run_with_repair(customer_id, acc, _work_op)
         # Defensive: a tuple here is the shape that produced "Targets: 2" and two
         # failed sends on an account with hundreds of contacts. The contract is a
         # list now, and anything else is coerced rather than silently messaged.
@@ -1985,18 +1995,34 @@ async def _channel_flow(customer_id, acc: dict, title: str, msg) -> None:
         w = worker.worker_for_account(acc)
         remote = bool(w and not worker.is_local(w))
         try:
+            import session_store
+
+            # Both steps run through run_with_repair. An INVALID_AUTH here is
+            # usually not a dead account at all: it is a session file that is not
+            # on the server running the work (a re-login that moved servers, a
+            # token login that never wrote a file, a rebuilt worker). The repair
+            # writes the stored session onto the right server and retries once.
             if remote:
-                created = await worker.api_call(w, "POST", "/channel/create", {
-                    "customer_id": customer_id, "phone": phone,
-                    "title": title}, timeout=180)
+                async def _create_op():
+                    return await worker.api_call(w, "POST", "/channel/create", {
+                        "customer_id": customer_id, "phone": phone,
+                        "title": title}, timeout=180)
+
+                created = await session_store.run_with_repair(
+                    customer_id, acc, _create_op)
                 guid = created.get("channel_guid")
                 await asyncio.sleep(config.CAMPAIGN_STEP_DELAY)
-                added = await worker.api_call(w, "POST", "/channel/add", {
-                    "customer_id": customer_id, "phone": phone,
-                    "channel_guid": guid,
-                    "target": config.CHANNEL_MEMBER_TARGET,
-                    "batch": config.CHANNEL_ADD_BATCH,
-                    "delay": config.CHANNEL_ADD_DELAY}, timeout=1800)
+
+                async def _add_op():
+                    return await worker.api_call(w, "POST", "/channel/add", {
+                        "customer_id": customer_id, "phone": phone,
+                        "channel_guid": guid,
+                        "target": config.CHANNEL_MEMBER_TARGET,
+                        "batch": config.CHANNEL_ADD_BATCH,
+                        "delay": config.CHANNEL_ADD_DELAY}, timeout=1800)
+
+                added = await session_store.run_with_repair(
+                    customer_id, acc, _add_op)
                 member_count = int(added.get("added") or 0)
             else:
                 import account_conn
@@ -2008,8 +2034,12 @@ async def _channel_flow(customer_id, acc: dict, title: str, msg) -> None:
                 async def _create(client):
                     return await rb.create_channel(client, title)
 
-                guid = await account_conn.fresh_call(customer_id, phone, _create,
-                                                     timeout=180)
+                async def _create_op():
+                    return await account_conn.fresh_call(
+                        customer_id, phone, _create, timeout=180)
+
+                guid = await session_store.run_with_repair(
+                    customer_id, acc, _create_op)
                 await asyncio.sleep(config.CAMPAIGN_STEP_DELAY)
 
                 async def _seed(client):
@@ -2018,8 +2048,12 @@ async def _channel_flow(customer_id, acc: dict, title: str, msg) -> None:
                         batch=config.CHANNEL_ADD_BATCH,
                         delay=config.CHANNEL_ADD_DELAY)
 
-                member_count = await account_conn.fresh_call(
-                    customer_id, phone, _seed, timeout=1800) or 0
+                async def _seed_op():
+                    return await account_conn.fresh_call(
+                        customer_id, phone, _seed, timeout=1800)
+
+                member_count = await session_store.run_with_repair(
+                    customer_id, acc, _seed_op) or 0
         except Exception as exc:  # noqa: BLE001
             code = await logbus.error(exc, context=f"rb channel {phone}",
                                       customer=customer_id)
@@ -2125,13 +2159,22 @@ async def _step_token(event, st):
     aid = db.add_account(uid, display, name=values.get("name") or "",
                          worker_id=(w or {}).get("id"))
     db.set_session_blob(uid, aid, values)
+
+    # ACTUALLY WRITE THE SESSION FILE. Storing the five values in the database
+    # and stopping there is what made a token login report "Session Saved: YES"
+    # while no server had a session for the account at all — so the first real
+    # operation connected unauthenticated and answered INVALID_AUTH.
+    import session_store
+    placed = await session_store.place(uid, db.get_account(uid, aid))
     rows = [
         cards.kv("Status", "SUCCESS"),
         cards.kv("Phone", display),
         cards.kv("Login Method", "SESSION"),
-        cards.kv("Session Saved", "YES"),
+        cards.kv("Session Saved", "YES" if placed else "NO"),
         cards.kv("Time", cards.now()),
     ]
+    if not placed:
+        rows.append("⚠️ سشن روی سرور نوشته نشد — توکن را بررسی کن.")
     footer = f"--| 🌍 - Worker : #{(w or {}).get('tag', 'master')}"
     await logbus.event("✅ - #rubika_login", rows + [cards.kv("Customer", uid)],
                        footer=footer)

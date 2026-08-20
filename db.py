@@ -957,6 +957,24 @@ def add_account(customer_id, phone: str, name: str = "", user_id: str = "",
         "UPDATE accounts SET name = ?, user_id = ?, status = 'active' "
         "WHERE customer_id = ? AND phone = ?",
         (name or "", str(user_id or ""), cid, phone))
+    # THE ROUTING FIX. A re-login can land on a DIFFERENT server than last time,
+    # and the session file only exists where the login actually happened.
+    #
+    # This UPDATE used to omit worker_id, so INSERT OR IGNORE kept the value from
+    # the first login forever. An account that was re-logged-in on a worker still
+    # pointed at the master (or at an old worker), so worker_for_account() sent
+    # every job to a server that HAS NO SESSION FILE for it. rubpy then happily
+    # connected UNAUTHENTICATED, and the first signed call answered INVALID_AUTH
+    # while contacts read as zero — the two symptoms that looked like a broken
+    # channel feature and a broken contacts reader for days.
+    #
+    # Only written when the caller actually names a server: passing None must not
+    # silently move an account off the worker that holds its session.
+    if worker_id is not None:
+        c.execute(
+            "UPDATE accounts SET worker_id = ? "
+            "WHERE customer_id = ? AND phone = ?",
+            (int(worker_id), cid, phone))
     conn.commit()
     row = _row(c.execute(
         "SELECT id FROM accounts WHERE customer_id = ? AND phone = ?", (cid, phone)))

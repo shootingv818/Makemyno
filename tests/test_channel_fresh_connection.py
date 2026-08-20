@@ -172,10 +172,22 @@ def test_worker_prepare_uses_a_fresh_connection():
     assert "account_conn.call(" not in section
 
 
+def _function_body(body: str, header: str) -> str:
+    """One whole top-level function. A fixed byte window stopped covering the
+    function as soon as the code grew, which reports a present fix as missing."""
+    start = body.index(header)
+    rest = body[start + len(header):]
+    end = len(rest)
+    for marker in ("\nasync def ", "\ndef ", "\nclass "):
+        at = rest.find(marker)
+        if at != -1:
+            end = min(end, at)
+    return header + rest[:end]
+
+
 def test_the_panel_channel_flow_uses_a_fresh_connection():
     body = _src("rubika_panel.py")
-    start = body.index("async def _channel_flow")
-    section = body[start:start + 2500]
+    section = _function_body(body, "async def _channel_flow")
     assert "fresh_call" in section, \
         "the local channel path must use a fresh connection too"
 

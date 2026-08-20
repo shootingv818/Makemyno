@@ -128,6 +128,36 @@ def _import_key_from_private(private_key):
     return None
 
 
+def import_session(phone: str, customer_id, values: dict) -> bool:
+    """WRITE a portable session onto this machine's session store. NO connect.
+
+    A Rubika session is five values (auth, private_key, guid, phone,
+    user_agent). Given those, the session can be rebuilt on ANY server without a
+    login code — which is how an account moves between the master and a worker.
+
+    This is deliberately WRITE-ONLY, exactly as the reference does it:
+    session.insert() only touches the session file, so importing can never open a
+    second live connection and therefore can never provoke AUTH_FROM_ANOTHER. The
+    real connection happens later, when a job runs, under the busy registry.
+
+    Returns True when a session file was written.
+    """
+    if not values or not values.get("auth"):
+        return False
+    normalized = normalize_phone(phone or values.get("phone") or "")
+    if not normalized:
+        return False
+    client = _make_client(session_path(normalized, customer_id))
+    client.session.insert(
+        auth=values.get("auth"),
+        guid=values.get("guid"),
+        user_agent=values.get("user_agent"),
+        phone_number=normalized,
+        private_key=values.get("private_key"),
+    )
+    return True
+
+
 async def start_login(phone: str, customer_id, pass_key: str = None) -> dict:
     """Phase 1: connect + request the login code (handles 2FA pass_key)."""
     phone = normalize_phone(phone)
