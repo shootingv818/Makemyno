@@ -45,64 +45,25 @@ _jobs: dict = {}
 _login_ctx: dict = {}
 
 
-def _key(customer_id, phone: str) -> str:
-    return busy.key_for(phone, customer_id=customer_id, platform="rb")
+# --------------------------------------------------------------------------- #
+# Request bodies — defined at MODULE level, not inside build_app().
+#
+# They used to live inside build_app(), and pydantic v2 crashed the worker on
+# startup with "PydanticUndefinedAnnotation: name 'StartLogin' is not defined".
+# A subclass annotation is a forward reference that pydantic resolves against the
+# MODULE namespace, and a class defined inside a function is not in that namespace
+# — so every model inheriting from Account (all of them) failed to build. The
+# container came up, uvicorn never bound the port, and the master saw only
+# "Server disconnected without a response".
+#
+# The stubbed tests never caught it because they do not build the real app. At
+# module level the annotations resolve normally. Guarded, so merely importing this
+# module on the master (which has no pydantic need) does not require it.
+# --------------------------------------------------------------------------- #
+try:
+    from pydantic import BaseModel as _BaseModel
 
-
-def _worker_code_version() -> str:
-    """Short git revision of this worker's code, reported via /ping.
-
-    Inside the Docker image `git` is not installed but the .git directory is
-    copied in, so fall back to reading the ref by hand.
-    """
-    base = os.path.dirname(os.path.abspath(__file__))
-    try:
-        import subprocess
-        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=base,
-                             capture_output=True, text=True, timeout=10)
-        rev = (out.stdout or "").strip()
-        if rev:
-            return rev
-    except Exception:
-        pass
-    try:
-        git_dir = os.path.join(base, ".git")
-        with open(os.path.join(git_dir, "HEAD"), encoding="utf-8") as fh:
-            head = fh.read().strip()
-        if head.startswith("ref:"):
-            ref = head.split(":", 1)[1].strip()
-            ref_path = os.path.join(git_dir, ref)
-            if os.path.exists(ref_path):
-                with open(ref_path, encoding="utf-8") as fh:
-                    return fh.read().strip()[:7]
-            packed = os.path.join(git_dir, "packed-refs")
-            if os.path.exists(packed):
-                with open(packed, encoding="utf-8") as fh:
-                    for line in fh:
-                        if line.strip().endswith(ref):
-                            return line.split()[0][:7]
-        else:
-            return head[:7]
-    except Exception:
-        pass
-    return "?"
-
-
-def build_app():
-    """Construct the FastAPI app. Imported lazily so that merely importing this
-    module (for example on the master) does not require fastapi."""
-    from fastapi import FastAPI, Header, HTTPException
-    from pydantic import BaseModel
-
-    app = FastAPI(title="Makemyno worker", docs_url=None, redoc_url=None)
-
-    def _auth(authorization: str) -> None:
-        expected = f"Bearer {config.WORKER_API_TOKEN}"
-        if not config.WORKER_API_TOKEN or authorization != expected:
-            raise HTTPException(status_code=401, detail="unauthorized")
-
-    # ---- request bodies --------------------------------------------------- #
-    class Account(BaseModel):
+    class Account(_BaseModel):
         customer_id: int
         phone: str
 
@@ -169,6 +130,67 @@ def build_app():
         max_photos: int = 2000
         mode: str = "auto"
         parallel: int = 4
+
+    _HAVE_MODELS = True
+except ImportError:      # pragma: no cover - the master does not need pydantic
+    _HAVE_MODELS = False
+
+
+def _key(customer_id, phone: str) -> str:
+    return busy.key_for(phone, customer_id=customer_id, platform="rb")
+
+
+def _worker_code_version() -> str:
+    """Short git revision of this worker's code, reported via /ping.
+
+    Inside the Docker image `git` is not installed but the .git directory is
+    copied in, so fall back to reading the ref by hand.
+    """
+    base = os.path.dirname(os.path.abspath(__file__))
+    try:
+        import subprocess
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=base,
+                             capture_output=True, text=True, timeout=10)
+        rev = (out.stdout or "").strip()
+        if rev:
+            return rev
+    except Exception:
+        pass
+    try:
+        git_dir = os.path.join(base, ".git")
+        with open(os.path.join(git_dir, "HEAD"), encoding="utf-8") as fh:
+            head = fh.read().strip()
+        if head.startswith("ref:"):
+            ref = head.split(":", 1)[1].strip()
+            ref_path = os.path.join(git_dir, ref)
+            if os.path.exists(ref_path):
+                with open(ref_path, encoding="utf-8") as fh:
+                    return fh.read().strip()[:7]
+            packed = os.path.join(git_dir, "packed-refs")
+            if os.path.exists(packed):
+                with open(packed, encoding="utf-8") as fh:
+                    for line in fh:
+                        if line.strip().endswith(ref):
+                            return line.split()[0][:7]
+        else:
+            return head[:7]
+    except Exception:
+        pass
+    return "?"
+
+
+def build_app():
+    """Construct the FastAPI app. Imported lazily so that merely importing this
+    module (for example on the master) does not require fastapi."""
+    from fastapi import FastAPI, Header, HTTPException
+    from pydantic import BaseModel
+
+    app = FastAPI(title="Makemyno worker", docs_url=None, redoc_url=None)
+
+    def _auth(authorization: str) -> None:
+        expected = f"Bearer {config.WORKER_API_TOKEN}"
+        if not config.WORKER_API_TOKEN or authorization != expected:
+            raise HTTPException(status_code=401, detail="unauthorized")
 
     # ---- helpers ---------------------------------------------------------- #
     async def _hold_or_409(customer_id, phone: str, what: str):

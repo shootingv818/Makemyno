@@ -282,7 +282,59 @@ def _install_httpx() -> None:
     sys.modules["httpx"] = httpx
 
 
+def _install_pydantic() -> None:
+    """A pydantic stand-in that reproduces the ONE behaviour that bit us.
+
+    Real pydantic v2 resolves a model's annotations against the module where the
+    class is defined. A model defined inside a function is not in any module
+    namespace, so a forward reference to a sibling model (Account -> StartLogin,
+    etc.) raises PydanticUndefinedAnnotation at class-creation time. The worker
+    crashed on exactly that, and the previous stub — which ignored annotations
+    entirely — could never have caught it.
+
+    So this stub, when a BaseModel subclass is created, walks its annotations and
+    checks that any name referenced as a string (a forward ref) actually exists in
+    that class's module globals. If not, it raises the same error pydantic does.
+    """
+    if "pydantic" in sys.modules:
+        return
+    pydantic = types.ModuleType("pydantic")
+    pydantic.VERSION = "2.6.4-stub"
+
+    class PydanticUndefinedAnnotation(NameError):
+        pass
+
+    class _ModelMeta(type):
+        def __new__(mcs, name, bases, ns):
+            cls = super().__new__(mcs, name, bases, ns)
+            # Only check real subclasses, not BaseModel itself.
+            if bases:
+                module = sys.modules.get(cls.__module__)
+                g = getattr(module, "__dict__", {})
+                for owner in cls.__mro__:
+                    for ann in getattr(owner, "__annotations__", {}).values():
+                        # A string annotation is a forward reference. Bare types
+                        # like `int` or `str | None` arrive already evaluated.
+                        if isinstance(ann, str) and ann.isidentifier() \
+                                and ann not in ("int", "str", "float", "bool",
+                                                "list", "dict"):
+                            if ann not in g and ann not in dir(__builtins__):
+                                raise PydanticUndefinedAnnotation(
+                                    f"name {ann!r} is not defined")
+            return cls
+
+    class BaseModel(metaclass=_ModelMeta):
+        def __init__(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    pydantic.BaseModel = BaseModel
+    pydantic.PydanticUndefinedAnnotation = PydanticUndefinedAnnotation
+    sys.modules["pydantic"] = pydantic
+
+
 def install() -> None:
     _install_rubpy()
     _install_telethon()
     _install_httpx()
+    _install_pydantic()
