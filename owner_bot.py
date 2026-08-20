@@ -92,7 +92,8 @@ def main_menu() -> list:
          Button.inline("📈 آمار ورکرها", b"wstats")],
         [Button.inline("🔍 عیب‌یابی", b"diag"),
          Button.inline("💾 بکاپ", b"backupmenu")],
-        [Button.inline("🩺 موتور سلامت", b"healthreport")],
+        [Button.inline("🩺 موتور سلامت", b"healthreport"),
+         Button.inline("🧪 تست سلامت داخلی", b"selftest")],
         [Button.inline("🧰 حالت تعمیر", b"maint"),
          Button.inline("⏸ توقف اضطراری", b"freeze")],
         [Button.inline("🛡 سپر ضداسپم", b"shield"),
@@ -1361,6 +1362,42 @@ async def health_report_cb(event):
             f"🔴 {d}" for d in report["dead_accounts"][:12]]
     await safe_edit(event, health.report_card() + ("\n".join(rows) if rows else ""),
                     buttons=[[Button.inline("🔄 بازخوانی", b"healthreport")],
+                             _back(b"home")])
+
+
+@bot.on(events.CallbackQuery(data=b"selftest"))
+async def selftest_cb(event):
+    """Run the safety-critical invariants against the live system and report.
+
+    This exists because the owner cannot exercise these by hand: session-collision
+    protection needs two operations racing for one account, worker distribution
+    needs several workers, tenant isolation needs several customers. The checks
+    simulate all of that with throwaway data and touch no real account, worker, or
+    customer.
+    """
+    if not is_owner(event):
+        return
+    import selftest
+    await safe_edit(event, cards.card("🧪 - #selftest", [
+        "در حال اجرای بررسی‌های ایمنی ..."]))
+    results = await selftest.run()
+    s = selftest.summary(results)
+
+    rows = [cards.kv("Result", f"{s['passed']}/{s['total']} سبز"),
+            cards.LINE]
+    for name, ok, detail in results:
+        rows.append(f"{'✅' if ok else '❌'} {name}")
+        if not ok:
+            rows.append(f"     ↳ {detail}")
+    rows.append(cards.LINE)
+    if s["all_ok"]:
+        rows.append("همه‌ی زیرسیستم‌های منطقی سالم‌اند.")
+        rows.append("توجه: این‌ها منطق را می‌سنجند؛ تماس واقعی با روبیکا/تلگرام")
+        rows.append("را فقط یک ارسال واقعی ثابت می‌کند.")
+    else:
+        rows.append("⚠️ موارد قرمز را برای پشتیبانی بفرست.")
+    await safe_edit(event, cards.panel_card("🧪 - #selftest", rows),
+                    buttons=[[Button.inline("🔄 اجرای دوباره", b"selftest")],
                              _back(b"home")])
 
 
