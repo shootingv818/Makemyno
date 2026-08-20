@@ -825,6 +825,71 @@ def snapshot_all() -> list:
 # --------------------------------------------------------------------------- #
 # API client (master -> worker, through the tunnel)
 # --------------------------------------------------------------------------- #
+async def worker_logs(worker: dict, tail: int = 60) -> str:
+    """The worker container's own log, over SSH.
+
+    Without this, "api error: Server disconnected without sending a response" is a
+    dead end: the tunnel opens, the remote side has nothing listening, and the
+    reason lives in a container log the owner can only reach by hand. The panel
+    should be able to answer "why is the worker down" on its own.
+
+    Also reports whether the container is running at all and why it last exited,
+    because a crash-looping container and a wedged one look identical from here.
+    """
+    conn = None
+    try:
+        conn = await _with_conn(worker, keepalive=False)
+        _code, out, _err = await _run(
+            conn,
+            f"echo '--- STATE ---'; "
+            f"docker inspect -f 'running={{{{.State.Running}}}} "
+            f"exit={{{{.State.ExitCode}}}} restarts={{{{.RestartCount}}}} "
+            f"err={{{{.State.Error}}}}' {CONTAINER} 2>&1; "
+            f"echo '--- LISTENING ---'; "
+            f"(ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null) "
+            f"| grep -F ':{config.WORKER_API_PORT}' || echo 'nothing on "
+            f"{config.WORKER_API_PORT}'; "
+            f"echo '--- LOG ---'; "
+            f"docker logs --tail {int(tail)} {CONTAINER} 2>&1 | tail -{int(tail)}",
+            timeout=120, label="خواندن لاگ ورکر")
+        return (out or "").strip() or "لاگی برنگشت."
+    except Exception as exc:      # noqa: BLE001
+        return f"خواندن لاگ نشد: {type(exc).__name__}: {str(exc)[:200]}"
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def explain_worker_log(blob: str) -> str:
+    """Turn a container log into a one-line verdict where we recognise the shape."""
+    low = (blob or "").lower()
+    checks = (
+        (("modulenotfounderror", "no module named"),
+         "یک کتابخانه در ایمیج نیست. ایمیج را با «⬆️ آپدیت» از نو بساز."),
+        (("asgi2", "'nonetype' object is not callable"),
+         "ترکیب ناسازگار fastapi/starlette/uvicorn. «⬆️ آپدیت» ایمیج را با "
+         "نسخه‌های پین‌شده از نو می‌سازد."),
+        (("worker settings missing", "worker_api_token"),
+         "فایل .env ورکر ناقص است — ورکر را حذف و دوباره اضافه کن."),
+        (("address already in use",),
+         f"پورت {config.WORKER_API_PORT} روی سرور اشغال است. "
+         f"«🔄 ری‌استارت» را بزن."),
+        (("running=false",),
+         "کانتینر اجرا نمی‌شود. خط LOG پایین می‌گوید چرا."),
+        (("nothing on",),
+         f"کانتینر بالاست ولی روی پورت {config.WORKER_API_PORT} گوش نمی‌دهد."),
+        (("traceback (most recent call last)",),
+         "ورکر با خطا بالا نیامده. تریس‌بک پایین را ببین."),
+    )
+    for needles, verdict in checks:
+        if any(n in low for n in needles):
+            return verdict
+    return ""
+
+
 async def api_call(worker: dict, method: str, path: str, payload: dict = None,
                    timeout: int = 120) -> dict:
     """Call the worker API. Raises on transport or HTTP error.

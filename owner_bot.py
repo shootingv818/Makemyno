@@ -810,6 +810,10 @@ async def worker_detail_cb(event):
         buttons += [
             [Button.inline("🔄 ری‌استارت", f"wkrst_{wid}".encode()),
              Button.inline("⬆️ آپدیت", f"wkupd_{wid}".encode())],
+            # The answer to "api error: Server disconnected" lives in the
+            # container's own log, and reaching it used to mean opening an SSH
+            # session by hand.
+            [Button.inline("📜 لاگ ورکر", f"wklog_{wid}".encode())],
             [Button.inline("🗑 حذف ورکر", f"wkdel_{wid}".encode())],
         ]
     buttons.append([Button.inline("👥 مشتری‌های این ورکر", f"wcust_{wid}".encode())])
@@ -930,6 +934,49 @@ async def worker_restart_cb(event):
     except Exception as exc:  # noqa: BLE001
         await logbus.error(exc, context=f"worker.restart {w['tag']}", notify=False)
     await worker_detail_cb(event)
+
+
+@bot.on(events.CallbackQuery(pattern=rb"wklog_(\d+)"))
+async def worker_log_cb(event):
+    """Show the worker container's own log, with a verdict where we can give one.
+
+    "api error: RemoteProtocolError: Server disconnected without sending a
+    response" means the tunnel opened and nothing was listening on the far side.
+    The reason is always in the container log, and reaching it used to require an
+    SSH session — so the panel could report a problem it could not explain.
+    """
+    if not is_owner(event):
+        return
+    wid = int(event.pattern_match.group(1))
+    w = db.get_worker(wid)
+    if not w or w.get("is_master"):
+        await event.answer("این ورکر لاگ کانتینر ندارد.", alert=True)
+        return
+    await event.answer("در حال خواندن لاگ ...")
+    blob = await worker.worker_logs(w, tail=60)
+    verdict = worker.explain_worker_log(blob)
+
+    rows = [cards.kv("Worker", w["tag"]),
+            cards.kv("Address", f"{w['ip']}:{w['ssh_port']}")]
+    if verdict:
+        rows += [cards.LINE, verdict]
+    rows.append(cards.LINE)
+    # Telegram caps a message near 4096 characters, so keep the tail and let the
+    # card explain that it is a tail.
+    tail = blob[-2400:]
+    if len(blob) > 2400:
+        rows.append("(انتهای لاگ)")
+    head = cards.panel_card("\U0001F4DC - #worker_log", rows)
+    buttons = [[Button.inline("\u267B\uFE0F \u062E\u0648\u0627\u0646\u062F\u0646 \u062F\u0648\u0628\u0627\u0631\u0647",
+                              f"wklog_{wid}".encode())],
+               [Button.inline("\U0001F504 \u0631\u06CC\u200C\u0627\u0633\u062A\u0627\u0631\u062A", f"wkrst_{wid}".encode()),
+                Button.inline("\u2B06\uFE0F \u0622\u067E\u062F\u06CC\u062A", f"wkupd_{wid}".encode())],
+               [Button.inline("\U0001F519 \u0648\u0631\u06A9\u0631", f"wk_{wid}".encode())]]
+    try:
+        await safe_edit(event, head + f"\n```\n{tail}\n```",
+                        buttons=buttons)
+    except Exception:
+        await safe_edit(event, head, buttons=buttons)
 
 
 @bot.on(events.CallbackQuery(pattern=rb"wkupd_(\d+)"))
