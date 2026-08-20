@@ -108,18 +108,31 @@ button, which rebuilds the Docker image on the remote server.
    `session_store.run_with_repair`. Currently repaired: `_channel_flow` (local +
    remote), `_collect_targets` (local + remote). Not yet: `_run_send` /
    `/send/start`, `contacts/add`, group join, tabchi/secretary paths.
-3. **Telegram send speed** is still reported as slow. The owner says the reference
-   solved it by not re-downloading the media for every chat — port the reference's
-   media reuse for the Telegram path and confirm against `telegram_multi_send.py`.
-4. **Live provisioning progress**: the owner wants a live log/percentage while a
-   worker is being built, instead of SSH-ing in. Partially done
-   (`test_provision_progress.py`); the Docker build step still looks hung for
-   minutes with no feedback.
-5. **Error cards mangle `**kwargs`** — the traceback rendering eats `**` because
+3. **Error cards mangle `**kwargs`** — the traceback rendering eats `**` because
    the message is parsed as Markdown. Send error cards with markdown disabled so
    source lines are readable.
-6. Offer (pending owner's yes/no): make `makemyno.sh update` print a reminder that
+4. Offer (pending owner's yes/no): make `makemyno.sh update` print a reminder that
    workers need updating separately.
+
+## Built and tested, but NOT yet confirmed on the owner's server
+
+Do not "re-fix" these. Read the code and the named tests first, then work out why
+the production run did not benefit. Historically the answer was almost always
+**the worker was running stale code** (a master update does not update workers).
+
+| Feature | Where it lives | Tests |
+| --- | --- | --- |
+| Telegram media pre-upload (the send-speed fix): each media item is uploaded ONCE to Saved Messages and every recipient gets a cheap copy of the file reference instead of a fresh upload. Wired on BOTH the multi-account path (`telegram_multi_send.py` `_run`) and the single-account path (`tg_panel.py`), each of which calls `prepare_content()` and passes `plan=` into `_deliver()`. Falls back to per-recipient upload if the pre-upload fails. | `telegram_multi_send.prepare_content`, `telegram_client.send_saved_media` / `forward_to` | `test_media_preupload.py`, `test_tg_speed_and_live_card.py` |
+| Live worker-build progress: `build_progress()` parses the legacy builder's `Step 3/12` lines AND pip's own output (which fills the long gap inside the single slowest step), and `progress_card_rows()` renders a percentage bar. | `worker.py` | `test_provision_progress.py` |
+| Worker log button: pulls `docker logs --tail 60` over SSH and runs `explain_worker_log()` to turn the blob into a plain-language verdict. | `worker.worker_logs` / `explain_worker_log`, `owner_bot.worker_log_cb` | `test_worker_logs.py` |
+
+**On Telegram speed specifically:** uploads are no longer the cost. What remains
+is deliberate anti-ban pacing — `clamp_tg_delay()` bounds the per-recipient delay
+to `TG_SEND_DELAY_MIN`..`TG_SEND_DELAY_MAX` (0.2s–1.0s, default 0.2s), and
+human-like "typing…" is OFF by default. If the owner still calls it slow, measure
+first: confirm the running code contains `prepare_content`, then look at the
+configured delay and at per-recipient entity resolution — do NOT re-port the
+upload fix, it is already there.
 
 ## Owner's standing preferences
 
