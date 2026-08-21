@@ -78,7 +78,9 @@ async def build_archive() -> tuple:
         worker_files, meta["unreachable"] = await worker.collect_worker_sessions(
             "rubika/workers")
     except Exception as exc:  # noqa: BLE001
-        meta["unreachable"].append("?")
+        meta["unreachable"].append(
+            f"collect_worker_sessions raised: {type(exc).__name__}: "
+            f"{str(exc)[:140]}")
         await logbus.warn("backup_partial", [
             cards.kv("Detail", f"worker sessions incomplete: {repr(exc)[:150]}")])
 
@@ -151,10 +153,18 @@ def summary_rows(meta: dict) -> list:
         cards.kv("Telegram", cards.num(meta.get("tg", 0))),
         cards.kv("Encryption", "🔐 ON"),
     ]
-    unreachable = meta.get("unreachable") or []
-    if unreachable:
-        rows.append(cards.kv("State", f"⚠️ partial — {len(unreachable)} "
-                                      f"worker(s) unreachable"))
+    problems = meta.get("unreachable") or []
+    if problems:
+        rows.append(cards.kv("State", f"⚠️ partial — {len(problems)} "
+                                      f"worker(s) not collected"))
+        # The reason, not just the count. "⚠️ partial — 1 worker(s) unreachable"
+        # on its own is unactionable: a wrong SSH password, a rebuilt worker with
+        # no sessions yet and a firewalled port all printed that same line, and
+        # the only way to tell them apart was to SSH in.
+        for problem in problems[:5]:
+            rows.append(cards.kv("Why", str(problem)[:160]))
+        if len(problems) > 5:
+            rows.append(cards.kv("More", f"+{len(problems) - 5}"))
     else:
         rows.append(cards.kv("State", "✅ complete"))
     return rows

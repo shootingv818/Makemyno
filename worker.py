@@ -1138,24 +1138,51 @@ async def collect_worker_sessions(prefix: str = "rubika/workers") -> tuple:
         return [], []
 
     async def _one(w):
+        """Return (tag, files, problem) for ONE worker. problem is "" when fine.
+
+        Three outcomes have to stay separate, and this used to collapse all of
+        them into a bare `True`:
+
+          * we could not connect at all           -> a real problem, with the reason
+          * we connected, sessions/ is not there  -> NOT a problem; a worker that
+            has never had an account placed on it simply has no directory yet, and
+            calling that "unreachable" sent the owner looking for a network fault
+            that did not exist
+          * we connected and read files           -> fine
+
+        The reason is carried out, because "⚠️ partial — 1 worker(s) unreachable"
+        with nothing else is unactionable: a wrong SSH password, a rebuilt worker
+        and a firewalled port all print the same line.
+        """
         files = []
         conn = None
         try:
             conn = await _with_conn(w, keepalive=False)
+        except Exception as exc:      # noqa: BLE001
+            return w["tag"], files, (f"ssh connect failed: "
+                                     f"{type(exc).__name__}: {str(exc)[:140]}")
+        try:
             sftp = await conn.start_sftp_client()
             safe_tag = str(w["tag"]).replace("#", "").replace("/", "_")
             root = f"{REMOTE_DATA}/sessions"
             try:
                 customer_dirs = await sftp.listdir(root)
-            except Exception:
-                return w["tag"], files, True
+            except Exception as exc:      # noqa: BLE001
+                # Missing directory is normal on a worker with no accounts.
+                # Anything else is worth reporting.
+                text = f"{type(exc).__name__}: {str(exc)[:120]}"
+                if "No such file" in str(exc) or "NoSuchFile" in type(exc).__name__:
+                    return w["tag"], files, ""
+                return w["tag"], files, f"cannot list {root}: {text}"
+            read_errors = []
             for cdir in customer_dirs:
                 if cdir in (".", ".."):
                     continue
                 cpath = f"{root}/{cdir}"
                 try:
                     names = await sftp.listdir(cpath)
-                except Exception:
+                except Exception as exc:      # noqa: BLE001
+                    read_errors.append(f"{cdir}: {type(exc).__name__}")
                     continue
                 for name in names:
                     if name in (".", ".."):
@@ -1164,30 +1191,33 @@ async def collect_worker_sessions(prefix: str = "rubika/workers") -> tuple:
                         async with sftp.open(f"{cpath}/{name}", "rb") as fh:
                             data = await fh.read()
                         files.append((f"{prefix}/{safe_tag}/{cdir}/{name}", data))
-                    except Exception:
-                        continue
-            return w["tag"], files, False
-        except Exception:
-            return w["tag"], files, True
+                    except Exception as exc:      # noqa: BLE001
+                        read_errors.append(f"{cdir}/{name}: {type(exc).__name__}")
+            if read_errors and not files:
+                return w["tag"], files, "read failed: " + "; ".join(read_errors[:3])
+            return w["tag"], files, ""
+        except Exception as exc:      # noqa: BLE001
+            return w["tag"], files, (f"sftp failed: "
+                                     f"{type(exc).__name__}: {str(exc)[:140]}")
         finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     results = await asyncio.gather(*[_one(w) for w in remotes],
                                    return_exceptions=True)
-    collected, unreachable = [], []
-    for item in results:
+    collected, problems = [], []
+    for index, item in enumerate(results):
         if isinstance(item, Exception):
-            unreachable.append("?")
+            tag = str(remotes[index].get("tag") or remotes[index].get("id"))
+            problems.append(f"{tag}: {type(item).__name__}: {str(item)[:140]}")
             continue
-        tag, files, failed = item
+        tag, files, problem = item
         collected.extend(files)
-        if failed:
-            unreachable.append(tag)
-    return collected, unreachable
+        if problem:
+            problems.append(f"{tag}: {problem}")
+    return collected, problems
 
 
 async def shutdown() -> None:

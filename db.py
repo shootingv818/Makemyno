@@ -584,6 +584,24 @@ def init() -> None:
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_tgm_recip "
               "ON tg_multi_recipients(job_id, account_id, state, idx)")
+    # FloodWait parking. Telegram can answer a send with "wait 11 hours", and the
+    # old code simply slept for it — inside the recipient loop, still holding the
+    # session claim. One throttled account froze the entire job, every other
+    # account waited its turn behind it, and to the customer the send had hung.
+    # An account is now PARKED with a cooldown and the job moves on to the next
+    # one; when the cooldown expires the account is picked back up and continues
+    # from its remaining recipients.
+    _ensure_columns(c, "tg_multi_accounts", {
+        "cooldown_until": "REAL DEFAULT 0",
+        "floodwait_rounds": "INTEGER DEFAULT 0",
+    })
+    # 'uncertain' recipients: in flight when the account was given up on, so we
+    # genuinely do not know whether the message arrived. Counting them as sent
+    # would double-message them on resume; counting them as failed would claim a
+    # delivery failure we cannot prove.
+    _ensure_columns(c, "tg_multi_jobs", {
+        "uncertain_count": "INTEGER DEFAULT 0",
+    })
     # Cross-account anti-duplicate WITHIN one job: once any account has reached a
     # person, a later account in the same job skips them. Without it a customer
     # with five accounts messages every shared contact five times.
@@ -2906,16 +2924,150 @@ def tgm_update_job(customer_id, job_id, **fields) -> None:
 
 
 def tgm_bump_job(customer_id, job_id, *, sent: int = 0, failed: int = 0,
-                 skipped: int = 0) -> None:
+                 skipped: int = 0, uncertain: int = 0) -> None:
     cid = _require_cid(customer_id)
     conn = _conn()
     conn.execute(
         "UPDATE tg_multi_jobs SET sent_count = sent_count + ?, "
         "failed_count = failed_count + ?, skipped_count = skipped_count + ?, "
+        "uncertain_count = uncertain_count + ?, "
         "updated_at = ? WHERE job_id = ? AND customer_id = ?",
-        (int(sent), int(failed), int(skipped), _now(), str(job_id), cid))
+        (int(sent), int(failed), int(skipped), int(uncertain), _now(),
+         str(job_id), cid))
     conn.commit()
     conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# FloodWait parking
+#
+# Telegram answers a send with "wait N seconds", and N can be hours. Sleeping
+# through it inside the recipient loop froze the whole job behind one account and
+# held its session claim the entire time. These four functions let the runner
+# park the account instead and come back to it.
+# --------------------------------------------------------------------------- #
+def tgm_park_account(customer_id, job_id, account_id, seconds: float,
+                     reason: str = "") -> int:
+    """Park an account until its cooldown expires. Returns the round number.
+
+    Any recipient left in flight goes back to pending: we never got a result for
+    it, so it must be retried rather than silently dropped.
+    """
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    row = conn.execute(
+        "SELECT floodwait_rounds FROM tg_multi_accounts "
+        "WHERE job_id = ? AND account_id = ? AND customer_id = ?",
+        (str(job_id), int(account_id), cid)).fetchone()
+    rounds = int((row["floodwait_rounds"] if row else 0) or 0) + 1
+    conn.execute(
+        "UPDATE tg_multi_recipients SET state = 'pending', last_error = ? "
+        "WHERE job_id = ? AND account_id = ? AND state = 'inflight'",
+        (reason[:200], str(job_id), int(account_id)))
+    conn.execute(
+        "UPDATE tg_multi_accounts SET state = 'floodwait', cooldown_until = ?, "
+        "floodwait_rounds = ?, last_error = ? "
+        "WHERE job_id = ? AND account_id = ? AND customer_id = ?",
+        (time.time() + max(1.0, float(seconds)), rounds, reason[:200],
+         str(job_id), int(account_id), cid))
+    conn.commit()
+    conn.close()
+    return rounds
+
+
+def tgm_next_cooldown(customer_id, job_id) -> float | None:
+    """Seconds until the earliest parked account wakes up, or None if none are."""
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    row = conn.execute(
+        "SELECT MIN(cooldown_until) AS soonest FROM tg_multi_accounts "
+        "WHERE job_id = ? AND customer_id = ? AND state = 'floodwait'",
+        (str(job_id), cid)).fetchone()
+    conn.close()
+    if not row or row["soonest"] is None:
+        return None
+    return max(0.0, float(row["soonest"]) - time.time())
+
+
+def tgm_wake_cooled(customer_id, job_id) -> int:
+    """Return every parked account whose cooldown has expired to pending."""
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    cur = conn.execute(
+        "UPDATE tg_multi_accounts SET state = 'pending', cooldown_until = 0 "
+        "WHERE job_id = ? AND customer_id = ? AND state = 'floodwait' "
+        "AND cooldown_until <= ?", (str(job_id), cid, time.time()))
+    changed = int(cur.rowcount or 0)
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def tgm_give_up_account(customer_id, job_id, account_id,
+                        reason: str = "") -> tuple:
+    """Abandon an account for good. Returns (skipped, uncertain).
+
+    Its still-pending recipients are skipped, and anything in flight becomes
+    'uncertain' — we never learned whether that one arrived, and pretending
+    either way would be a lie the customer acts on.
+    """
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    cur = conn.execute(
+        "UPDATE tg_multi_recipients SET state = 'uncertain', last_error = ? "
+        "WHERE job_id = ? AND account_id = ? AND state = 'inflight'",
+        (reason[:200], str(job_id), int(account_id)))
+    uncertain = int(cur.rowcount or 0)
+    cur = conn.execute(
+        "UPDATE tg_multi_recipients SET state = 'skipped', last_error = ? "
+        "WHERE job_id = ? AND account_id = ? AND state = 'pending'",
+        (reason[:200], str(job_id), int(account_id)))
+    skipped = int(cur.rowcount or 0)
+    conn.execute(
+        "UPDATE tg_multi_accounts SET state = 'failed', cooldown_until = 0, "
+        "last_error = ? WHERE job_id = ? AND account_id = ? AND customer_id = ?",
+        (reason[:200], str(job_id), int(account_id), cid))
+    conn.commit()
+    conn.close()
+    return skipped, uncertain
+
+
+def tgm_requeue_stopped_accounts(customer_id, job_id) -> int:
+    """Return accounts that were STOPPED (not failed) to pending.
+
+    A user stop, an error burst or a freeze are all recoverable: the customer
+    pressing continue means "try these again". A 'failed' account is not
+    requeued — its session is dead or it was given up on, and retrying it just
+    reproduces the same failure.
+    """
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    cur = conn.execute(
+        "UPDATE tg_multi_accounts SET state = 'pending', consec_fail = 0 "
+        "WHERE job_id = ? AND customer_id = ? AND state = 'stopped'",
+        (str(job_id), cid))
+    changed = int(cur.rowcount or 0)
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def tgm_reset_inflight(customer_id, job_id) -> int:
+    """Return every in-flight recipient to pending.
+
+    Called when a job is resumed after a restart: a row still marked inflight has
+    no owner, and leaving it there means that recipient is never attempted again.
+    """
+    cid = _require_cid(customer_id)
+    conn = _conn()
+    cur = conn.execute(
+        "UPDATE tg_multi_recipients SET state = 'pending' "
+        "WHERE job_id = ? AND customer_id = ? AND state = 'inflight'",
+        (str(job_id), cid))
+    changed = int(cur.rowcount or 0)
+    conn.commit()
+    conn.close()
+    return changed
 
 
 def tgm_list_jobs(customer_id, limit: int = 10) -> list:
@@ -2972,7 +3124,7 @@ def tgm_job_accounts(customer_id, job_id) -> list:
 def tgm_update_account(customer_id, job_id, account_id, **fields) -> None:
     cid = _require_cid(customer_id)
     allowed = {"state", "total", "sent_count", "failed_count", "consec_fail",
-               "last_error"}
+               "last_error", "cooldown_until", "floodwait_rounds"}
     sets, params = [], []
     for key, value in fields.items():
         if key in allowed:

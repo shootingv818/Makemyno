@@ -48,6 +48,23 @@ _live: dict = {}
 # Injected so a running job can refresh the customer's live card.
 _bot = None
 
+# A FloodWait no longer than this is simply waited out in place: parking the
+# account and reopening its session later costs more than the wait itself.
+# Anything longer parks the account so the rest of the job carries on without it.
+FLOOD_INLINE_MAX = 90
+
+# How many times one account may be throttled before the job gives up on it.
+# Retrying a rate-limited account indefinitely only deepens the limit, and its
+# remaining recipients are better handled by another account than by waiting all
+# day for this one.
+MAX_FLOODWAIT_ROUNDS = 3
+
+# The only states from which an account may be (re)started by the round loop.
+# 'running' is included because it means a turn was interrupted, not finished.
+# Everything else — done, failed, stopped, skipped, floodwait — is either
+# finished or waiting on a cooldown that the loop handles separately.
+RUNNABLE_STATES = frozenset({"pending", "running", ""})
+
 
 def bind(bot) -> None:
     global _bot
@@ -311,18 +328,72 @@ async def resume(customer_id, job_id) -> dict:
         raise ValueError("unknown job")
     db.tgm_update_job(customer_id, job_id, stop_requested=0, state="running",
                       last_error="")
+    # Accounts parked by a stop, an error burst or a freeze go back in the queue.
+    # The round loop only starts a runnable account, so without this a resumed
+    # job would skip every account that had been stopped — which is all of them.
+    # A 'failed' account is deliberately left out: its session is dead or it was
+    # given up on, and retrying it only reproduces the same failure.
+    db.tgm_requeue_stopped_accounts(customer_id, job_id)
     return await start(customer_id, job_id)
 
 
 async def _run(customer_id, job_id) -> None:
     control = _controls.setdefault(job_id, {"stop": False})
     try:
-        for account in db.tgm_job_accounts(customer_id, job_id):
+        # Any recipient still marked inflight belongs to a turn that was killed
+        # (restart, crash, forced stop). Nobody owns it, so without this it is
+        # never attempted again and the job can never reach 100%.
+        recovered = db.tgm_reset_inflight(customer_id, job_id)
+        if recovered:
+            await logbus.customer_action(
+                db.get_customer(customer_id), "tg_multi_recovered", [
+                    cards.kv("Job", job_id),
+                    cards.kv("Requeued", cards.num(recovered)),
+                ], platform="Telegram")
+
+        # Accounts are walked in rounds, not once. A single pass could never
+        # come back to an account parked on a FloodWait, so a throttled account
+        # lost the rest of its recipients even though the limit had expired long
+        # before the job ended.
+        while not control["stop"] and not db.are_sends_frozen():
+            worked = False
+            for account in db.tgm_job_accounts(customer_id, job_id):
+                if control["stop"] or db.are_sends_frozen():
+                    break
+                # An allow-list, deliberately. A skip-list let "stopped" through,
+                # and because accounts are now walked in ROUNDS an account that
+                # had already hit its consecutive-error ceiling was picked up
+                # again on the next pass and burned straight through the ceiling
+                # a second time. Only an account that is genuinely waiting for
+                # its turn may run.
+                if account["state"] not in RUNNABLE_STATES:
+                    continue
+                await _run_account(customer_id, job_id, account, control)
+                worked = True
             if control["stop"] or db.are_sends_frozen():
                 break
-            if account["state"] in ("done", "failed"):
-                continue
-            await _run_account(customer_id, job_id, account, control)
+            if worked:
+                continue                    # another pass: parked ones may be due
+
+            # Nothing runnable left. If accounts are parked, wait for the first
+            # cooldown to expire and carry on; the wait is interruptible so stop
+            # still answers immediately.
+            wait = db.tgm_next_cooldown(customer_id, job_id)
+            if wait is None:
+                break                       # genuinely finished
+            db.tgm_update_job(customer_id, job_id, state="waiting",
+                              current_phone="")
+            await logbus.customer_action(
+                db.get_customer(customer_id), "tg_multi_waiting", [
+                    cards.kv("Job", job_id),
+                    cards.kv("Resumes in", f"{int(wait)}s"),
+                    "همهٔ اکانت‌های باقی‌مانده در محدودیت تلگرام هستند. کار "
+                    "متوقف نشده — بعد از پایان محدودیت خودش ادامه می‌دهد.",
+                ], platform="Telegram")
+            if not await _sleep_unless_stopped(control, wait + 2):
+                break
+            db.tgm_wake_cooled(customer_id, job_id)
+            db.tgm_update_job(customer_id, job_id, state="running")
 
         counts = db.tgm_counts(customer_id, job_id)
         pending_left = counts.get("pending", 0)
@@ -349,6 +420,23 @@ async def _run(customer_id, job_id) -> None:
     finally:
         _controls.pop(job_id, None)
         _tasks.pop(job_id, None)
+
+
+async def _sleep_unless_stopped(control: dict, seconds: float,
+                               step: float = 2.0) -> bool:
+    """Sleep out a cooldown; return False if the job was stopped meanwhile.
+
+    A flat sleep of a FloodWait can be hours long, which would leave the stop
+    button dead for hours.
+    """
+    waited = 0.0
+    while waited < seconds:
+        if control.get("stop") or db.are_sends_frozen():
+            return False
+        chunk = min(step, seconds - waited)
+        await asyncio.sleep(chunk)
+        waited += chunk
+    return not control.get("stop")
 
 
 async def _run_account(customer_id, job_id, account: dict, control: dict) -> None:
@@ -404,6 +492,7 @@ async def _run_account(customer_id, job_id, account: dict, control: dict) -> Non
         consecutive = 0
         max_errors = db.get_max_errors(customer_id)
         stop_reason = ""
+        flood_seconds = 0
 
         while True:
             if control["stop"] or db.are_sends_frozen():
@@ -427,6 +516,12 @@ async def _run_account(customer_id, job_id, account: dict, control: dict) -> Non
                     skipped += 1
                     continue
 
+                # Claim the row BEFORE the send. If the process dies mid-send the
+                # row stays 'inflight', which is the honest state: we do not know
+                # whether it arrived. _run requeues those on resume, and an
+                # account given up on turns them into 'uncertain' rather than
+                # quietly counting them as delivered.
+                db.tgm_set_recipient(customer_id, job_id, row["idx"], "inflight")
                 try:
                     await _deliver(client, target, content, delay, plan=plan)
                     db.tgm_set_recipient(customer_id, job_id, row["idx"], "sent")
@@ -440,10 +535,27 @@ async def _run_account(customer_id, job_id, account: dict, control: dict) -> Non
                         # Not a failure: Telegram is asking us to slow down.
                         # Counting this as an error is how healthy accounts used
                         # to get abandoned.
-                        db.tgm_update_account(customer_id, job_id, account_id,
-                                             last_error=f"floodwait {wait}s")
-                        await asyncio.sleep(wait)
-                        continue
+                        #
+                        # A SHORT wait is slept through here, because parking and
+                        # reopening the session costs more than the wait itself.
+                        # A LONG one must NOT be: this used to
+                        # `await asyncio.sleep(wait)` unconditionally, inside the
+                        # recipient loop, still holding the session claim. An
+                        # 11-hour FloodWait therefore froze the whole job — every
+                        # other account queued behind the throttled one and the
+                        # customer saw a send that had simply stopped. The
+                        # account is now PARKED and the job moves to the next
+                        # one; the runner picks it back up when the cooldown
+                        # expires and it continues from what is left.
+                        if wait <= FLOOD_INLINE_MAX:
+                            db.tgm_update_account(
+                                customer_id, job_id, account_id,
+                                last_error=f"floodwait {wait}s (waiting)")
+                            await asyncio.sleep(wait)
+                            continue
+                        stop_reason = "floodwait"
+                        flood_seconds = wait
+                        break
                     if _is_fatal_account_error(exc):
                         stop_reason = "auth_failed"
                         db.tg_set_status(customer_id, account_id, "dead")
@@ -467,13 +579,50 @@ async def _run_account(customer_id, job_id, account: dict, control: dict) -> Non
 
         db.tgm_bump_job(customer_id, job_id, sent=sent, failed=failed,
                         skipped=skipped)
-        db.tgm_update_account(customer_id, job_id, account_id,
-                             sent_count=sent, failed_count=failed,
-                             consec_fail=consecutive,
-                             state={"auth_failed": "failed",
-                                    "error_burst": "stopped",
-                                    "stopped": "stopped"}.get(stop_reason, "done"),
-                             last_error=stop_reason)
+
+        if stop_reason == "floodwait":
+            # Park, or give up if this account has already been throttled too
+            # many times. Giving up skips what is left for THIS account instead
+            # of retrying a rate-limited account forever, which only deepens the
+            # limit.
+            reason = f"FloodWait {flood_seconds}s"
+            rounds = db.tgm_park_account(customer_id, job_id, account_id,
+                                         flood_seconds, reason)
+            if rounds > MAX_FLOODWAIT_ROUNDS:
+                gave_up, uncertain = db.tgm_give_up_account(
+                    customer_id, job_id, account_id,
+                    f"{reason} — throttled {rounds} times, giving up")
+                db.tgm_bump_job(customer_id, job_id, skipped=gave_up,
+                                uncertain=uncertain)
+                await logbus.customer_action(
+                    db.get_customer(customer_id), "tg_multi_account_gave_up", [
+                        cards.kv("Job", job_id),
+                        cards.kv("Phone", phone),
+                        cards.kv("Reason", reason),
+                        cards.kv("Rounds", rounds),
+                        cards.kv("Skipped", cards.num(gave_up)),
+                        cards.kv("Uncertain", cards.num(uncertain)),
+                    ], platform="Telegram")
+            else:
+                await logbus.customer_action(
+                    db.get_customer(customer_id), "tg_multi_account_parked", [
+                        cards.kv("Job", job_id),
+                        cards.kv("Phone", phone),
+                        cards.kv("Reason", reason),
+                        cards.kv("Round", f"{rounds}/{MAX_FLOODWAIT_ROUNDS}"),
+                        cards.kv("Sent", cards.num(sent)),
+                        "این اکانت موقتاً کنار گذاشته شد و بعد از پایان محدودیت "
+                        "خودش ادامه می‌دهد. بقیهٔ اکانت‌ها متوقف نمی‌شوند.",
+                    ], platform="Telegram")
+        else:
+            db.tgm_update_account(customer_id, job_id, account_id,
+                                 sent_count=sent, failed_count=failed,
+                                 consec_fail=consecutive,
+                                 state={"auth_failed": "failed",
+                                        "error_burst": "stopped",
+                                        "stopped": "stopped"}.get(stop_reason,
+                                                                  "done"),
+                                 last_error=stop_reason)
         if sent:
             db.tg_incr_sent(customer_id, account_id, sent)
             db.incr_customer_sends(customer_id, sent)
@@ -642,9 +791,12 @@ def progress_card(customer_id, job_id) -> str:
     sent = int(live.get("sent", job.get("sent_count") or 0))
     failed = int(live.get("failed", job.get("failed_count") or 0))
     skipped = int(live.get("skipped", job.get("skipped_count") or 0))
-    done = sent + failed + skipped
+    uncertain = int(live.get("uncertain", job.get("uncertain_count") or 0))
+    inflight = int(live.get("inflight", 0))
+    done = sent + failed + skipped + uncertain
 
-    labels = {"queued": "در صف", "running": "در حال اجرا", "waiting": "در انتظار",
+    labels = {"queued": "در صف", "running": "در حال اجرا",
+              "waiting": "⏳ در انتظار پایان محدودیت",
               "stop_requested": "در حال توقف", "stopped": "متوقف شد",
               "paused": "نیمه‌کاره", "done": "پایان", "failed": "خطا",
               "frozen": "ارسال موقتاً متوقف"}
@@ -657,6 +809,26 @@ def progress_card(customer_id, job_id) -> str:
         cards.kv("Skipped", cards.num(skipped)),
         cards.kv("Mutual first", cards.num(job.get("mutual_total") or 0)),
     ]
+    # Only shown when non-zero: an "Uncertain: 0" row on every card trains people
+    # to ignore the one time it matters.
+    if uncertain:
+        rows.append(cards.kv("Uncertain", cards.num(uncertain)))
+    if inflight:
+        rows.append(cards.kv("In flight", cards.num(inflight)))
+
+    # Parked accounts, and when the job picks itself back up. A job that is
+    # waiting out a FloodWait is NOT stuck, and without this line it looks
+    # identical to one that has died.
+    parked = [a for a in (job.get("accounts") or [])
+              if a.get("state") == "floodwait"]
+    if parked:
+        soonest = db.tgm_next_cooldown(customer_id, job_id)
+        rows.append(cards.kv("Throttled", f"{len(parked)} اکانت"))
+        if soonest is not None:
+            minutes = int(soonest // 60)
+            rows.append(cards.kv(
+                "Resumes in",
+                f"{minutes} دقیقه" if minutes >= 1 else f"{int(soonest)} ثانیه"))
     # Where the time actually goes. Without this, "sending is slow" is a guess:
     # the configured gap and the platform's own latency are indistinguishable from
     # the outside, and lowering the speed setting cannot fix a slow network.
@@ -676,8 +848,8 @@ def progress_card(customer_id, job_id) -> str:
     per_account = job.get("per_account") or {}
     for account in job.get("accounts") or []:
         mark = {"done": "✅", "running": "▶️", "failed": "🔴",
-                "stopped": "⛔", "skipped": "⏭", "pending": "▫️"}.get(
-                    account.get("state"), "▫️")
+                "stopped": "⛔", "skipped": "⏭", "pending": "▫️",
+                "floodwait": "⏳"}.get(account.get("state"), "▫️")
         seen = per_account.get(int(account["account_id"]), {})
         acc_sent = int(seen.get("sent", account.get("sent_count") or 0))
         acc_total = int(account.get("total") or 0) or sum(seen.values())

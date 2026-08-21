@@ -2147,6 +2147,32 @@ async def _channel_flow(customer_id, acc: dict, title: str, msg) -> None:
             return
         w = worker.worker_for_account(acc)
         remote = bool(w and not worker.is_local(w))
+        # Reported to the customer at the end, and updated live along the way.
+        # The old report said only "Members added", so a channel that was created
+        # WITHOUT the advert in it looked like a complete success — the one thing
+        # the customer needed to know was the one thing missing.
+        marker_found = forwarded = False
+        forward_error = ""
+        member_count = 0
+
+        async def _live(*rows) -> None:
+            """Edit the customer's card in place.
+
+            Creating the channel and seeding it can take half an hour with the
+            default target of 300 members in batches of 80. With no updates in
+            between, a working campaign is indistinguishable from a hung one, and
+            customers stop it and start again — which is how accounts get
+            reported.
+            """
+            if msg is None:
+                return
+            try:
+                await msg.edit(cards.card("📢 کانال", list(rows)))
+            except Exception:      # noqa: BLE001 - a card is never worth failing
+                pass
+
+        await _live(cards.kv("Phone", phone), cards.kv("Channel", title),
+                    "⏳ ساخت کانال ...")
         try:
             import session_store
 
@@ -2172,6 +2198,16 @@ async def _channel_flow(customer_id, acc: dict, title: str, msg) -> None:
                     raise RuntimeError(
                         "worker returned no channel_guid: "
                         f"{str(created)[:160]}")
+                marker_found = bool(created.get("marker_found"))
+                forwarded = bool(created.get("forwarded"))
+                forward_error = created.get("forward_error") or ""
+                await _live(
+                    cards.kv("Phone", phone), cards.kv("Channel", title),
+                    "✅ کانال ساخته شد",
+                    cards.kv("Post", "✅ ارسال شد" if forwarded
+                             else "❌ ارسال نشد"),
+                    f"⏳ عضو کردن مخاطبین تا {config.CHANNEL_MEMBER_TARGET} نفر — "
+                    "چند دقیقه طول می‌کشد.")
                 if marker and not created.get("forwarded"):
                     # The channel exists, so this is not fatal — but it must not
                     # pass silently, or the owner sees an empty channel and no
@@ -2237,6 +2273,13 @@ async def _channel_flow(customer_id, acc: dict, title: str, msg) -> None:
                         customer_id, acc, _create_op)
                 if not guid:
                     raise RuntimeError("create_channel returned no guid")
+                await _live(
+                    cards.kv("Phone", phone), cards.kv("Channel", title),
+                    "✅ کانال ساخته شد",
+                    cards.kv("Post", "✅ ارسال شد" if forwarded
+                             else "❌ ارسال نشد"),
+                    f"⏳ عضو کردن مخاطبین تا {config.CHANNEL_MEMBER_TARGET} نفر — "
+                    "چند دقیقه طول می‌کشد.")
                 if marker and not forwarded:
                     await logbus.event("⚠️ - #rb_channel_no_post", [
                         cards.kv("Customer", customer_id),
@@ -2272,12 +2315,31 @@ async def _channel_flow(customer_id, acc: dict, title: str, msg) -> None:
                     pass
             return
 
+    # Say plainly whether the advert reached the channel. A report of
+    # "Members added: 300" on a channel with no post in it is worse than useless:
+    # the customer believes the campaign ran.
+    if not marker:
+        post_line = "— بدون مارکر (پستی ارسال نشد)"
+    elif forwarded:
+        post_line = "✅ ارسال شد"
+    elif not marker_found:
+        post_line = f"❌ پیام نشان‌دار «{marker}» در Saved پیدا نشد"
+    else:
+        post_line = f"❌ ارسال نشد — {forward_error or 'دلیل نامعلوم'}"
+
     rows = [
         cards.kv("Phone", phone),
         cards.kv("Channel", title),
-        cards.kv("Members added", cards.num(member_count)),
-        cards.kv("Marker", f"«{marker}»"),
+        cards.kv("Post", post_line),
+        cards.kv("Members added",
+                 f"{cards.num(member_count)} از {config.CHANNEL_MEMBER_TARGET}"),
+        cards.kv("Marker", f"«{marker}»" if marker else "—"),
     ]
+    if marker and not forwarded:
+        rows.append("⚠️ کانال ساخته شد ولی پست تبلیغ داخلش نیست. مارکر را در "
+                    "کپشن پیام ذخیره‌شده بگذار و دوباره بساز.")
+    if not member_count:
+        rows.append("⚠️ هیچ مخاطبی عضو نشد.")
     await logbus.customer_action(db.get_customer(customer_id), "channel_send",
                                 rows, platform="Rubika")
     text = cards.panel_card("📢 - #channel_report", rows)
