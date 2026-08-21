@@ -2489,9 +2489,15 @@ async def _channel_flow(customer_id, acc: dict, title: str, msg) -> None:
             # A refusal that is NOT an auth problem gets its own sentence. Showing
             # only an error code for this sent the owner hunting a session bug
             # that did not exist — the session was signing fine the whole time.
+            # Recognise the verdict however it arrives. Locally it is the real
+            # exception; from a worker it comes back inside a WorkerAPIError whose
+            # text carries the 403 detail, because an HTTP boundary cannot
+            # transport a Python class.
+            text = str(exc)
             denied = (isinstance(exc, rb.ChannelNotPermitted)
-                      or "ChannelNotPermitted" in str(type(exc).__name__)
-                      or "not permitted to create a channel" in str(exc))
+                      or type(exc).__name__ == "ChannelNotPermitted"
+                      or "ChannelNotPermitted" in text
+                      or "not permitted to create a channel" in text)
             code = await logbus.error(exc, context=f"rb channel {phone}",
                                       customer=customer_id)
             if denied:

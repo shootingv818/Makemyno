@@ -208,6 +208,17 @@ async def signed_call(customer_id, phone: str, fn, *args, timeout: float = None,
                           **kwargs)
     except InvalidAuthError:
         raise
+    except rb.ChannelNotPermitted:
+        # A VERDICT, not a failure to route around. It already proved the session
+        # signs correctly by making a signed call on the same connection, so a
+        # second attempt on a fresh connection can only produce the same refusal —
+        # and wrapping it in a generic RuntimeError destroyed the one piece of
+        # information the whole probe existed to produce. That is what happened:
+        # the panel's isinstance check never matched, the worker returned 400
+        # instead of 403, and the customer saw
+        # "signed call failed on both connections" with the explanation truncated
+        # away mid-sentence.
+        raise
     except Exception as warm_error:      # noqa: BLE001
         if not is_auth_error(warm_error):
             raise
@@ -217,14 +228,20 @@ async def signed_call(customer_id, phone: str, fn, *args, timeout: float = None,
                     return await asyncio.wait_for(fn(client, *args, **kwargs),
                                                   timeout=timeout)
                 return await fn(client, *args, **kwargs)
+        except rb.ChannelNotPermitted:
+            raise                       # same verdict; never wrap it
         except Exception as fresh_error:      # noqa: BLE001
             # Both shapes failed. Report the pair, because "which connection
             # shape did we use" is the single most useful fact for this class of
             # bug and it must not be lost.
+            #
+            # 400 characters each, not 120. The reasons here are whole sentences
+            # and the first version cut them off at "...on the same connection
+            # ret", removing the verdict from the middle of its own explanation.
             raise RuntimeError(
                 f"signed call failed on both connections; "
-                f"warm={type(warm_error).__name__}: {str(warm_error)[:120]} | "
-                f"fresh={type(fresh_error).__name__}: {str(fresh_error)[:120]}"
+                f"warm={type(warm_error).__name__}: {str(warm_error)[:400]} | "
+                f"fresh={type(fresh_error).__name__}: {str(fresh_error)[:400]}"
             ) from fresh_error
 
 

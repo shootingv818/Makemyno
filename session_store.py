@@ -51,7 +51,16 @@ def _auth_shaped(err: Exception) -> bool:
     Kept in step with account_conn.is_auth_error, and deliberately narrow: a
     muted group or a network hiccup must not trigger a session rewrite.
     """
+    # A verdict that the session is FINE but the operation is refused must never
+    # trigger a session rewrite. ChannelNotPermitted quotes the platform's
+    # original INVALID_AUTH inside its own message, so a plain text match saw it
+    # as a dead session and pointlessly re-placed a perfectly good session, then
+    # retried an operation that cannot succeed.
+    if type(err).__name__ == "ChannelNotPermitted":
+        return False
     text = str(err).upper()
+    if "NOT PERMITTED TO CREATE A CHANNEL" in text:
+        return False
     return ("INVALID_AUTH" in text or "INVALIDAUTH" in text
             or "NOT_REGISTERED" in text or "AUTH_FROM_ANOTHER" in text)
 
