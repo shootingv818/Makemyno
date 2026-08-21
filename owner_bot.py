@@ -1089,15 +1089,47 @@ async def _run_worker_update(owner_id: int, workers: list) -> None:
     end up with a fleet that is half old and half new with nobody knowing which.
     """
     done, failed = [], []
+
+    # One card for the whole run, edited in place. A rebuild is a full docker
+    # build per worker — five to fifteen minutes each — and it reported nothing at
+    # all until every worker had finished. Updating four workers meant a silent
+    # hour with no way to tell a slow build from a dead SSH session.
+    msg = None
+    try:
+        msg = await bot.send_message(owner_id, cards.card("⬆️ - #update_all", [
+            cards.kv("Workers", len(workers)), "⏳ شروع ..."]))
+    except Exception:      # noqa: BLE001
+        msg = None
+    last = [""]
+
+    async def _render(live_block: str) -> None:
+        body = [cards.kv("Workers", f"{len(done) + len(failed)}/{len(workers)}")]
+        if done:
+            body.append(cards.kv("Done", ", ".join(done)))
+        if failed:
+            body.append(cards.kv("Failed", ", ".join(t for t, _ in failed)))
+        body.append(cards.LINE)
+        body += [ln for ln in live_block.splitlines() if ln.strip()]
+        text = cards.card("⬆️ - #update_all", body)
+        if msg is None or text == last[0]:
+            return                       # Telegram rejects an identical edit
+        last[0] = text
+        try:
+            await msg.edit(text)
+        except Exception:      # noqa: BLE001
+            pass
+
     for w in workers:
         try:
-            code, out, err = await worker.update_worker(w)
+            code, out, err = await worker.update_worker(w, on_progress=_render)
             if code == 0:
                 done.append(w["tag"])
             else:
                 failed.append((w["tag"], (err or out)[-160:]))
         except Exception as exc:  # noqa: BLE001
             failed.append((w["tag"], f"{type(exc).__name__}: {str(exc)[:120]}"))
+        await _render(f"✅ {w['tag']} تمام شد" if w["tag"] in done
+                      else f"⚠️ {w['tag']} ناموفق")
 
     # Health check after the update: knowing WHICH ones broke, before the
     # customers find out, is the whole point of doing this staged.

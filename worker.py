@@ -313,6 +313,79 @@ async def _run_streaming(conn, command: str, on_line, timeout: float = None,
     return code, "\n".join(lines[-120:])
 
 
+async def _run_live(conn, command: str, say, headline: str,
+                    timeout: float = None, label: str = "",
+                    tick: float = 4.0):
+    """Run a long command with a card that keeps MOVING. Returns (code, tail).
+
+    Two separate problems, and streaming alone only solves one of them.
+
+    Only the docker build was streamed, so every other long step left the card
+    frozen on its own headline. "🐳 بررسی و نصب Docker ..." can sit there for many
+    minutes: apt waits up to 180 seconds for the dpkg lock a fresh Ubuntu box holds
+    while unattended-upgrades runs, then installs, then possibly falls back to
+    curl | sh from get.docker.com. Nothing distinguished that from a hang.
+
+    And streaming by itself would not have fixed it, because these commands run
+    with -qq and print almost nothing. So a TICKER re-renders the live block on a
+    timer with an elapsed clock and the last line seen. The clock is the part that
+    answers "is it stuck?" — a number that keeps counting is proof the step is
+    still being waited on, even in total silence.
+
+    The headline is kept identical across updates on purpose: the owner panel
+    promotes a step to history only when the headline CHANGES, so a changing
+    headline here would stack one copy per tick.
+    """
+    state = {"last": "", "started": time.time(), "shown": 0.0}
+    stop = asyncio.Event()
+
+    def _rows() -> str:
+        elapsed = int(time.time() - state["started"])
+        rows = [headline, f"⏱ {elapsed // 60}:{elapsed % 60:02d}"]
+        if state["last"]:
+            rows.insert(1, f"   ↳ {state['last'][:70]}")
+        return "\n".join(rows)
+
+    async def _emit() -> None:
+        try:
+            await say(_rows())
+        except Exception:      # noqa: BLE001 - a card is never worth failing a build
+            pass
+
+    async def _ticker():
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=tick)
+                return
+            except asyncio.TimeoutError:
+                pass
+            state["shown"] = time.time()
+            await _emit()
+
+    async def _on_line(line: str):
+        """Render on a NEW line as well, not only on the tick.
+
+        A step that prints something useful and then goes quiet would otherwise
+        never show it: the command can finish between two ticks. Throttled, because
+        a docker build prints thousands of lines and Telegram would rate-limit us
+        long before the build ended.
+        """
+        state["last"] = line
+        now = time.time()
+        if now - state["shown"] >= 1.0:
+            state["shown"] = now
+            await _emit()
+
+    await _emit()
+    ticker = asyncio.create_task(_ticker())
+    try:
+        return await _run_streaming(conn, command, _on_line, timeout=timeout,
+                                    label=label)
+    finally:
+        stop.set()
+        ticker.cancel()
+
+
 def build_progress(line: str, state: dict) -> bool:
     """Update `state` from one line of docker/pip output. True if it changed.
 
@@ -433,7 +506,8 @@ async def provision_worker(ip: str, ssh_port: int, ssh_user: str, ssh_pass: str,
         if "READY" not in (out or ""):
             return {"ok": False, "error": _explain_setup_failure(out, err, ip)}
 
-        await say("🐳 بررسی و نصب Docker ...")
+        # No `say` here: _run_live posts the headline itself and then keeps it
+        # updated. Saying it twice would freeze the first copy in the history.
         # A fresh Ubuntu box runs unattended-upgrades right after boot and holds
         # the dpkg lock for minutes. Without waiting for that lock the docker
         # install silently fails and the later build dies with
@@ -456,23 +530,30 @@ async def provision_worker(ip: str, ssh_port: int, ssh_user: str, ssh_pass: str,
             "if command -v docker >/dev/null 2>&1; then docker --version; "
             "echo DOCKER_OK; else echo DOCKER_MISSING; fi\n"
         )
-        code, out, err = await _run(conn, install_script,
-                                    timeout=config.SSH_STEP_TIMEOUT,
-                                    label="نصب Docker")
+        # 2>&1 so apt's and curl's progress reach the card. Without it the only
+        # thing streamed is stdout, and apt writes most of its noise to stderr.
+        code, out = await _run_live(
+            conn, f"{{\n{install_script}}} 2>&1\n", say,
+            "🐳 بررسی و نصب Docker ...",
+            timeout=config.SSH_STEP_TIMEOUT, label="نصب Docker")
+        # _run_streaming reads stdout only, so the whole block is redirected above.
+        # Without it apt and curl — which write to stderr — produced a silent card
+        # AND an empty diagnosis on failure.
+        err = ""
         if "DOCKER_OK" not in (out or ""):
             return {"ok": False, "error": _explain_setup_failure(out, err, ip)}
 
-        await say("📥 دریافت سورس ...")
-        code, out, err = await _run(
+        code, out = await _run_live(
             conn,
             f"rm -rf {REMOTE_DIR} && "
-            f"git clone --depth 1 -b {config.GIT_BRANCH} "
-            f"{config.GIT_REPO_URL} {REMOTE_DIR}",
+            f"git clone --progress --depth 1 -b {config.GIT_BRANCH} "
+            f"{config.GIT_REPO_URL} {REMOTE_DIR} 2>&1",
+            say, "📥 دریافت سورس ...",
             timeout=config.SSH_STEP_TIMEOUT, label="دریافت سورس",
         )
         if code != 0:
             return {"ok": False,
-                    "error": f"git clone شکست خورد: {err[:200] or out[:200]}"}
+                    "error": f"git clone شکست خورد: {out[:300]}"}
 
         await say("📝 نوشتن تنظیمات ورکر ...")
         # A worker gets ONLY what it needs to execute work: no bot token, no
@@ -505,9 +586,10 @@ async def provision_worker(ip: str, ssh_port: int, ssh_user: str, ssh_pass: str,
         if free_mb and free_mb < config.WORKER_MIN_DISK_MB:
             # Try to make room from our own leftovers first: a failed build leaves
             # dangling layers behind, and several failed attempts add up.
-            await say(f"🧹 فضا کم است ({free_mb}MB) — پاک‌سازی داکر ...")
-            await _run(conn, "docker system prune -af --volumes || true",
-                       timeout=config.SSH_STEP_TIMEOUT, label="پاک‌سازی داکر")
+            await _run_live(
+                conn, "docker system prune -af --volumes 2>&1 || true", say,
+                f"🧹 فضا کم است ({free_mb}MB) — پاک‌سازی داکر ...",
+                timeout=config.SSH_STEP_TIMEOUT, label="پاک‌سازی داکر")
             _code, out, _err = await _run(
                 conn, "df -Pm / | awk 'NR==2{print $4}'", timeout=60,
                 label="بررسی دیسک")
@@ -659,7 +741,7 @@ async def restart_worker(worker: dict) -> tuple:
         conn.close()
 
 
-async def update_worker(worker: dict) -> tuple:
+async def update_worker(worker: dict, on_progress=None) -> tuple:
     """Move the worker onto the latest code of config.GIT_BRANCH and rebuild.
 
     The remote's origin is repointed first, so a worker cloned from an older
@@ -681,8 +763,34 @@ async def update_worker(worker: dict) -> tuple:
             f"docker run -d --name {CONTAINER} --restart always --network=host "
             f"--env-file {REMOTE_DIR}/.env -v {REMOTE_DATA}:/app/data {IMAGE}"
         )
-        return await _run(conn, cmd, timeout=config.SSH_BUILD_TIMEOUT,
-                          label="به‌روزرسانی ورکر")
+        if on_progress is None:
+            return await _run(conn, cmd, timeout=config.SSH_BUILD_TIMEOUT,
+                              label="به‌روزرسانی ورکر")
+
+        # Reuse the build parser so the same percentage and step counter
+        # appear here, rather than inventing a second, poorer rendering.
+        #
+        # This step had NO progress at all, and it is a full docker build —
+        # the same five to fifteen minutes provisioning takes. Updating a
+        # fleet meant staring at one unchanging line per worker with no way
+        # to tell a slow build from a dead SSH session.
+        state = {"step": 0, "steps": 0, "detail": "", "sub": "",
+                 "started": time.time()}
+        tag = worker.get("tag") or worker.get("id")
+
+        async def _on_line(line: str):
+            if build_progress(line, state):
+                try:
+                    await on_progress("\n".join(
+                        [f"⬆️ {tag}"] + progress_card_rows(state)))
+                except Exception:      # noqa: BLE001
+                    pass
+
+        code, out = await _run_streaming(conn, f"{{ {cmd}; }} 2>&1",
+                                         _on_line,
+                                         timeout=config.SSH_BUILD_TIMEOUT,
+                                         label="به‌روزرسانی ورکر")
+        return code, out, ""
     finally:
         conn.close()
 
