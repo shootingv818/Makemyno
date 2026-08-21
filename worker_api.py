@@ -797,8 +797,8 @@ def build_app():
                 message_id = None
                 if body.marker:
                     message_id = await rb.find_marked_message(client, body.marker)
-                guid = await rb.create_channel(client, body.title,
-                                               body.description)
+                guid = await rb.create_channel_checked(client, body.title,
+                                                       body.description)
                 forwarded = False
                 forward_error = ""
                 if message_id and guid:
@@ -820,6 +820,13 @@ def build_app():
             return {"ok": True, "channel_guid": guid,
                     "marker_found": marker_found, "forwarded": forwarded,
                     "forward_error": forward_error}
+        except rb.ChannelNotPermitted as exc:
+            # 403, not 400: the master must be able to tell "Rubika refuses this
+            # operation for this account" from "something broke". Both read the
+            # same as a 400 carrying an INVALID_AUTH string, which is exactly how
+            # this was misdiagnosed for three rounds.
+            raise HTTPException(status_code=403,
+                                detail=f"ChannelNotPermitted: {str(exc)[:300]}")
         except Exception as exc:
             raise HTTPException(status_code=400,
                                 detail=f"{type(exc).__name__}: {str(exc)[:200]}")

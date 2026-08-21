@@ -928,6 +928,51 @@ async def create_channel(client: Client, title: str, description: str = None) ->
     return guid
 
 
+class ChannelNotPermitted(RuntimeError):
+    """addChannel was refused while the session itself is provably healthy."""
+
+
+async def create_channel_checked(client: Client, title: str,
+                                 description: str = None) -> str:
+    """create_channel, but able to tell WHY an INVALID_AUTH happened.
+
+    addChannel answering INVALID_AUTH does not mean the session is bad. Every
+    api_version-6 request in rubpy is signed the same way, so if the session were
+    unusable then sending would fail too — and in production it does not: an
+    account sent 5 of 1376 messages happily while every channel creation on the
+    same session, on the same connection, came back INVALID_AUTH. That points at
+    a per-operation refusal (Rubika restricting channel creation for the account),
+    not at auth.
+
+    Three rounds of work went into auth, connection shape and session placement
+    because the error text said INVALID_AUTH and nothing distinguished the two
+    cases. So on failure this makes ONE cheap SIGNED call on the SAME client:
+
+      * get_me succeeds -> the session signs correctly, so the refusal belongs to
+        addChannel alone. Raise ChannelNotPermitted, which the panel turns into a
+        sentence the customer can act on.
+      * get_me fails too -> the session really is the problem, and the original
+        error is re-raised untouched.
+    """
+    try:
+        return await create_channel(client, title, description)
+    except Exception as exc:      # noqa: BLE001
+        if not is_auth_failure(exc):
+            raise
+        try:
+            me = await get_self_guid(client)
+        except Exception:      # noqa: BLE001 - the session is the problem
+            raise exc from None
+        if not me:
+            raise
+        raise ChannelNotPermitted(
+            "Rubika refused addChannel for this account while the session is "
+            f"provably valid (a signed call on the same connection returned "
+            f"{me}). The account is not permitted to create a channel — usually "
+            f"a new or restricted number. Original: {type(exc).__name__}: "
+            f"{str(exc)[:120]}") from exc
+
+
 async def add_channel_members(client: Client, channel_guid: str, member_guids: list):
     """Add a batch of member guids to a channel. Tolerant of rubpy version diffs."""
     if not member_guids:

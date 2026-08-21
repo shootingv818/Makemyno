@@ -254,8 +254,38 @@ def test_push_session_clears_the_reason_on_success(monkeypatch):
 # the success card tells the truth
 # --------------------------------------------------------------------------- #
 def test_the_success_card_reports_what_was_verified():
-    section = _function_source("rubika_panel.py", "async def _step_token")
-    assert 'cards.kv("Verified", "YES")' in section, \
-        "SUCCESS on a login that never connected is the defect itself"
+    section = _function_source("rubika_panel.py", "async def _step_token",
+                               code_only=True)
+    # NOT a flat YES. The first version printed "Verified: YES" even when the
+    # worker's probe had come back inconclusive, which is the same false
+    # confidence that let a dead token look like a healthy account.
+    assert '"YES" if checked["verified"] else "UNCONFIRMED"' in section, \
+        "a login must report what it actually established, not a constant"
     assert 'cards.kv("Contacts"' in section, \
         "a contact count is proof the session really read something"
+
+
+def test_an_uncounted_contact_total_is_not_printed_as_zero():
+    """The remote path never counts contacts; 0 there means "unknown"."""
+    section = _function_source("rubika_panel.py", "async def _step_token",
+                               code_only=True)
+    assert 'contacts is None' in section, \
+        ("printing 0 made an account with 1376 contacts look empty, and the "
+         "customer reported it as a bug — correctly")
+
+
+def test_the_remote_verifier_does_not_invent_a_contact_count():
+    section = _function_source("rubika_panel.py",
+                               "async def _verify_session_token",
+                               code_only=True)
+    assert '"contacts": None' in section, \
+        "a hard 0 was being reported as a real reading"
+
+
+def test_an_inconclusive_probe_is_not_reported_as_verified():
+    section = _function_source("rubika_panel.py",
+                               "async def _verify_session_token",
+                               code_only=True)
+    assert 'not verdict.get("skipped")' in section, \
+        ("the worker answers skipped=True when it cannot reach a conclusion, and "
+         "that is not proof of health")

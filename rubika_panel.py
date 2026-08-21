@@ -43,6 +43,9 @@ _respond = None
 
 # Live job controls: account_id -> {"stop": bool, "pause": bool, ...}
 _jobs: dict = {}
+# customer_id -> the shared state behind one multi-account card, so the card can
+# be rebuilt on demand while the run is in progress.
+_multi_jobs: dict = {}
 
 MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "data", "rb_media")
@@ -264,7 +267,7 @@ def _ctl_buttons(account_id, paused: bool = False) -> list:
 
 
 async def _run_send(customer_id, acc: dict, mode: str, text: str,
-                    targets: list, owner_msg=None) -> None:
+                    targets: list, owner_msg=None, progress: dict = None) -> None:
     """Send to a prepared target list, holding the session for the whole run."""
     aid, phone = acc["id"], acc["phone"]
     key = _key(customer_id, phone)
@@ -274,6 +277,11 @@ async def _run_send(customer_id, acc: dict, mode: str, text: str,
     ctl = {"stop": False, "pause": False, "sent": 0, "failed": 0,
            "total": len(targets), "phone": phone, "state": "running",
            "last_error": "", "reason": ""}
+    # The multi-account card reads the SAME dict the send loop writes, so its
+    # numbers move with the run instead of appearing only at the end.
+    if progress is not None:
+        progress["ctl"] = ctl
+        ctl["progress"] = progress
     _jobs[aid] = ctl
 
     async with busy.hold(key, "send", customer_id=customer_id,
@@ -1389,8 +1397,46 @@ def setup(bot, state, gate, safe_edit, respond, register_steps) -> None:
             [Button.inline("📌 تنظیم مارکر", b"rbmarker")],
             [Button.inline("✍️ متن دوم", b"rbtext2"),
              Button.inline("✍️ متن ساده", b"rbplain")],
+            [Button.inline("🗑 پاک کردن همه", b"rbclearall")],
             _back(b"rb"),
         ])
+
+    @bot.on(events.CallbackQuery(data=b"rbclearall"))
+    async def rb_clear_all_ask(event):
+        """Clear every content field in one press.
+
+        Clearing them one by one meant three separate menus and sending "-" into
+        each, which is why it was described as hard. Confirmed rather than
+        immediate, because wiping a marker mid-campaign is not something to do by
+        a mis-tap.
+        """
+        if not await gate(event):
+            return
+        uid = event.sender_id
+        await safe_edit(event, cards.card("🗑 پاک کردن محتوا", [
+            cards.kv("Marker", f"«{db.get_marker(uid)}»"),
+            cards.kv("متن دوم", f"«{db.get_setting(uid, 'rb_text2') or '—'}»"),
+            cards.kv("متن ساده", f"«{db.get_setting(uid, 'rb_plain') or '—'}»"),
+            cards.LINE,
+            "هر سه مورد بالا پاک می‌شوند. مارکر به مقدار پیش‌فرض برمی‌گردد.",
+        ]), buttons=[
+            [Button.inline("✅ بله، پاک کن", b"rbclearall_yes")],
+            [Button.inline("🔙 لغو", b"rbcontent")],
+        ])
+
+    @bot.on(events.CallbackQuery(data=b"rbclearall_yes"))
+    async def rb_clear_all_do(event):
+        if not await gate(event):
+            return
+        uid = event.sender_id
+        for key in ("rb_marker", "rb_text2", "rb_plain"):
+            db.set_setting(uid, key, "")
+        await logbus.customer_action(db.get_customer(uid), "content_cleared", [
+            cards.kv("Fields", "marker, text2, plain")], platform="Rubika")
+        await safe_edit(event, cards.card("✅ پاک شد", [
+            cards.kv("Marker", f"«{db.get_marker(uid)}»"),
+            "مارکر به مقدار پیش‌فرض برگشت. متن دوم و متن ساده خالی شدند.",
+        ]), buttons=[_back(b"rbcontent")])
 
     for cb, step, title, hint in (
         (b"rbmarker", "rb_marker", "📌 تنظیم مارکر",
@@ -1881,6 +1927,77 @@ async def _render_brain(event):
     await _safe_edit(event, cards.card("🧠 مغز", body), buttons=rows)
 
 
+_MULTI_LABELS = {
+    "queued": "▫️ در صف",
+    "preparing": "⏳ آماده‌سازی",
+    "running": "▶️ در حال ارسال",
+    "done": "✅ پایان",
+    "failed": "⚠️ خطا",
+    "no_marker": "❌ مارکر پیدا نشد",
+    "auth_failed": "🔴 سشن باطل",
+    "error_burst": "⛔ خطاهای پشت‌سرهم",
+    "stopped": "⏹ متوقف",
+    "frozen": "⏸ ارسال متوقف",
+    "waiting": "⏳ در انتظار",
+    "busy": "⏳ اکانت مشغول",
+    "no_targets": "❌ مخاطبی نداشت",
+}
+
+
+def multi_card(state: dict) -> str:
+    """The live multi-account card.
+
+    There was no such card at all: _run_multi called _prepare_and_send with
+    event=None, which is the branch that skips creating a message, so the customer
+    got one line — "⏳ شروع شد" — and then silence until the whole run finished.
+    Two accounts sending to a thousand people each looked identical to a crash.
+    """
+    # Pull the live numbers out of each account's control dict while it runs. The
+    # slot's own sent/failed are only written when the account finishes, so
+    # reading those alone would show 0 for the entire run — the exact complaint
+    # that this card exists to answer.
+    for slot in state["accounts"].values():
+        ctl = slot.get("ctl")
+        if ctl:
+            slot["sent"] = int(ctl.get("sent") or 0)
+            slot["failed"] = int(ctl.get("failed") or 0)
+            slot["total"] = int(ctl.get("total") or slot.get("total") or 0)
+            if ctl.get("state") and slot.get("state") == "running":
+                slot["state"] = ctl["state"]
+            if ctl.get("reason"):
+                slot["reason"] = ctl["reason"]
+
+    rows = [cards.kv("Accounts", len(state["accounts"]))]
+    total = sum(int(a.get("total") or 0) for a in state["accounts"].values())
+    sent = sum(int(a.get("sent") or 0) for a in state["accounts"].values())
+    failed = sum(int(a.get("failed") or 0) for a in state["accounts"].values())
+    if total:
+        rows.append(cards.kv("Progress",
+                             f"{cards.bar(sent + failed, total)}  "
+                             f"{sent + failed}/{total}"))
+    rows.append(cards.kv("Sent", cards.num(sent)))
+    if failed:
+        rows.append(cards.kv("Failed", cards.num(failed)))
+    finished = sum(1 for a in state["accounts"].values()
+                   if a.get("state") not in ("queued", "preparing", "running"))
+    rows.append(cards.kv("Finished", f"{finished}/{len(state['accounts'])}"))
+    rows.append(cards.LINE)
+    for phone, acc in state["accounts"].items():
+        label = _MULTI_LABELS.get(acc.get("state"), acc.get("state") or "—")
+        line = f"{label}  {phone}"
+        if acc.get("total"):
+            line += f" → ✉️{cards.num(acc.get('sent') or 0)}/{cards.num(acc['total'])}"
+        if acc.get("failed"):
+            line += f"  ⚠️{cards.num(acc['failed'])}"
+        rows.append(line)
+        # The reason belongs next to the account it happened to. Without it the
+        # customer sees a red mark and has no idea whether to re-login, press
+        # continue, or fix their marker.
+        if acc.get("reason"):
+            rows.append(f"   ↳ {str(acc['reason'])[:110]}")
+    return cards.panel_card("📤 - #multi_send", rows)
+
+
 async def _run_multi(customer_id, account_ids: list) -> None:
     """Run accounts on the same server one after another, different servers in
     parallel — one session at a time per box keeps the pattern human."""
@@ -1897,22 +2014,77 @@ async def _run_multi(customer_id, account_ids: list) -> None:
         cards.kv("Server groups", len(groups)),
     ], platform="Rubika")
 
+    state = {"accounts": {a["phone"]: {"state": "queued", "total": 0, "sent": 0,
+                                       "failed": 0, "reason": ""}
+                          for a in accounts}}
+    msg = None
+    if _bot:
+        try:
+            msg = await _bot.send_message(int(customer_id), multi_card(state))
+        except Exception:      # noqa: BLE001
+            msg = None
+    _multi_jobs[int(customer_id)] = state
+
+    async def _refresh() -> None:
+        """Edit the one card in place until the run ends.
+
+        Skips an unchanged edit: Telegram rejects an edit whose content is
+        identical and that error is pure noise in the log.
+        """
+        last = ""
+        while True:
+            await asyncio.sleep(config.TG_STATS_REFRESH)
+            if msg is None:
+                return
+            text = multi_card(state)
+            if text != last:
+                last = text
+                try:
+                    await msg.edit(text)
+                except Exception:      # noqa: BLE001
+                    pass
+
+    refresher = asyncio.create_task(_refresh()) if msg else None
+
     async def _sequential(group):
         for acc in group:
             if db.are_sends_frozen():
-                return
-            await _prepare_and_send(customer_id, acc, "marker", "", None)
+                state["accounts"][acc["phone"]]["state"] = "frozen"
+                continue
+            await _prepare_and_send(customer_id, acc, "marker", "", None,
+                                    progress=state["accounts"][acc["phone"]])
 
-    await asyncio.gather(*[_sequential(g) for g in groups.values()],
-                         return_exceptions=True)
+    try:
+        await asyncio.gather(*[_sequential(g) for g in groups.values()],
+                            return_exceptions=True)
+    finally:
+        if refresher:
+            refresher.cancel()
+        _multi_jobs.pop(int(customer_id), None)
+
+    if msg:
+        try:
+            await msg.edit(multi_card(state), buttons=[_back(b"rbaccs")])
+        except Exception:      # noqa: BLE001
+            pass
     await logbus.customer_action(cust, "multi_send_done", [
-        cards.kv("Accounts", len(accounts))], platform="Rubika")
+        cards.kv("Accounts", len(accounts)),
+        cards.kv("Sent", cards.num(sum(int(a.get("sent") or 0)
+                                       for a in state["accounts"].values()))),
+    ], platform="Rubika")
 
 
 async def _prepare_and_send(customer_id, acc: dict, mode: str, text: str,
-                            event=None) -> None:
-    """Collect the target list, then run the send under a single session claim."""
+                            event=None, progress: dict = None) -> None:
+    """Collect the target list, then run the send under a single session claim.
+
+    `progress` is the multi-account card's slot for this account. It is filled in
+    as the run proceeds so the shared card can show what each account is doing;
+    the single-account path passes nothing and behaves exactly as before.
+    """
     phone = acc["phone"]
+    if progress is not None:
+        progress["state"] = "preparing"
     msg = None
     if event is not None:
         try:
@@ -1923,6 +2095,9 @@ async def _prepare_and_send(customer_id, acc: dict, mode: str, text: str,
     try:
         targets = await _collect_targets(customer_id, acc, mode)
     except Exception as exc:  # noqa: BLE001
+        if progress is not None:
+            progress["state"] = "failed"
+            progress["reason"] = f"{type(exc).__name__}: {str(exc)[:90]}"
         code = await logbus.error(exc, context=f"rb targets {phone}",
                                   customer=customer_id)
         if msg:
@@ -1934,6 +2109,9 @@ async def _prepare_and_send(customer_id, acc: dict, mode: str, text: str,
                 pass
         return
     if not targets:
+        if progress is not None:
+            progress["state"] = "no_targets"
+            progress["reason"] = "این اکانت هیچ مخاطبی نداشت"
         if msg:
             try:
                 await msg.edit(cards.card("🚀 ارسال", [
@@ -1942,7 +2120,11 @@ async def _prepare_and_send(customer_id, acc: dict, mode: str, text: str,
             except Exception:
                 pass
         return
-    await _run_send(customer_id, acc, mode, text, targets, msg)
+    if progress is not None:
+        progress["total"] = len(targets)
+        progress["state"] = "running"
+    await _run_send(customer_id, acc, mode, text, targets, msg,
+                    progress=progress)
 
 
 def _guids_only(items) -> list:
@@ -2250,7 +2432,7 @@ async def _channel_flow(customer_id, acc: dict, title: str, msg) -> None:
                     message_id = None
                     if marker:
                         message_id = await rb.find_marked_message(client, marker)
-                    new_guid = await rb.create_channel(client, title)
+                    new_guid = await rb.create_channel_checked(client, title)
                     forwarded = False
                     forward_error = ""
                     if message_id and new_guid:
@@ -2304,8 +2486,37 @@ async def _channel_flow(customer_id, acc: dict, title: str, msg) -> None:
                 member_count = await session_store.run_with_repair(
                     customer_id, acc, _seed_op) or 0
         except Exception as exc:  # noqa: BLE001
+            # A refusal that is NOT an auth problem gets its own sentence. Showing
+            # only an error code for this sent the owner hunting a session bug
+            # that did not exist — the session was signing fine the whole time.
+            denied = (isinstance(exc, rb.ChannelNotPermitted)
+                      or "ChannelNotPermitted" in str(type(exc).__name__)
+                      or "not permitted to create a channel" in str(exc))
             code = await logbus.error(exc, context=f"rb channel {phone}",
                                       customer=customer_id)
+            if denied:
+                text = cards.card("⛔ این اکانت اجازهٔ ساخت کانال ندارد", [
+                    cards.kv("Phone", phone),
+                    cards.kv("کد خطا", code, width=8),
+                    cards.LINE,
+                    "سشن این اکانت سالم است و ارسال با آن کار می‌کند — روبیکا "
+                    "فقط ساختِ کانال را برایش رد می‌کند. معمولاً برای شماره‌های "
+                    "تازه یا محدودشده پیش می‌آید.",
+                    "با یک اکانت دیگر امتحان کن، یا چند روز از این شماره برای "
+                    "ارسال عادی استفاده کن و بعد دوباره تست کن.",
+                ])
+                if msg:
+                    try:
+                        await msg.edit(text, buttons=[_back(b"rbaccs")])
+                        return
+                    except Exception:
+                        pass
+                try:
+                    await _bot.send_message(int(customer_id), text,
+                                            buttons=[_back(b"rbaccs")])
+                except Exception:
+                    pass
+                return
             if msg:
                 try:
                     await msg.edit(cards.card("⚠️ مشکلی پیش آمد", [
@@ -2504,7 +2715,10 @@ async def _step_token(event, st):
     # difference.
     w = await worker.pick_worker_for_login()
     try:
-        name, guid, contacts = await _verify_session_token(uid, w, phone, values)
+        checked = await _verify_session_token(uid, w, phone, values)
+        name = checked["name"]
+        guid = checked["guid"]
+        contacts = checked["contacts"]
     except Exception as exc:  # noqa: BLE001
         code = await logbus.error(exc, context=f"rb token login {display}",
                                   customer=uid)
@@ -2538,11 +2752,21 @@ async def _step_token(event, st):
         cards.kv("Status", "SUCCESS"),
         cards.kv("Phone", display),
         cards.kv("Login Method", "SESSION"),
-        cards.kv("Verified", "YES"),
-        cards.kv("Contacts", cards.num(contacts)),
+        # Report what was actually established, not a flat YES. A login that only
+        # got an inconclusive answer out of the worker must not claim it verified
+        # the session — that is the same false confidence that made a dead token
+        # look like a healthy account.
+        cards.kv("Verified", "YES" if checked["verified"] else "UNCONFIRMED"),
+        # None means "not counted here", which is different from zero. Printing 0
+        # made an account with 1376 contacts look empty.
+        cards.kv("Contacts", "—" if contacts is None else cards.num(contacts)),
         cards.kv("Session Saved", "YES" if placed else "NO"),
         cards.kv("Time", cards.now()),
     ]
+    if not checked["verified"]:
+        rows.append("⚠️ سشن نوشته شد ولی ورکر نتوانست تأییدش کند"
+                    + (f" ({checked['note']})" if checked.get("note") else "")
+                    + ". اگر اولین ارسال خطا داد، با کد ورود وارد شو.")
     if not placed:
         rows.append("⚠️ سشن روی سرور نوشته نشد — توکن را بررسی کن.")
     footer = f"--| 🌍 - Worker : #{(w or {}).get('tag', 'master')}"
@@ -2582,10 +2806,19 @@ async def _verify_session_token(customer_id, w, phone: str, values: dict):
         if verdict.get("dead"):
             raise RuntimeError("Rubika rejected this session (it is expired or "
                                "was revoked)")
-        # skipped=True means the worker could not reach a conclusion — treat it
-        # as unproven rather than as proof of health, but do not fail the login
-        # over an inconclusive probe.
-        return (values.get("name") or "", values.get("guid") or "", 0)
+        # An inconclusive probe is NOT proof of health, and must not be reported
+        # as one. This returned a hard 0 for the contact count and the card then
+        # printed "Contacts: 0" — which reads as "this account has no contacts".
+        # The same account showed 1376 recipients on its first send minutes
+        # later. The count was never read on this path at all; saying so is the
+        # only honest option.
+        proven = not verdict.get("skipped")
+        return {"name": values.get("name") or "",
+                "guid": values.get("guid") or "",
+                "contacts": None,          # not counted on the remote path
+                "verified": proven,
+                "note": "" if proven else (verdict.get("reason") or
+                                           "worker could not confirm")}
 
     # Local: import write-only first, then one connection that proves it signs.
     if not rb.import_session(phone, customer_id, values):
@@ -2595,7 +2828,8 @@ async def _verify_session_token(customer_id, w, phone: str, values: dict):
         guid = rb._guid_of(me) or values.get("guid") or ""   # noqa: SLF001
         name = rb._name_of(me, "") or ""                     # noqa: SLF001
         contacts = len(await rb.get_contacts_full(client))
-    return name, guid, contacts
+    return {"name": name, "guid": guid, "contacts": contacts,
+            "verified": True, "note": ""}
 
 
 async def _step_contacts_file(event, st):
