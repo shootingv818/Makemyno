@@ -59,6 +59,16 @@ FLOOD_INLINE_MAX = 90
 # day for this one.
 MAX_FLOODWAIT_ROUNDS = 3
 
+# A short note next to each account in the live card, so its state is readable
+# without knowing what the colours mean. Only for states that need explaining —
+# a finished or waiting account speaks for itself.
+_ACCOUNT_NOTE_FA = {
+    "floodwait": "محدودیت موقت — خودش ادامه می‌دهد",
+    "failed": "سشن باطل — ورود مجدد لازم است",
+    "stopped": "متوقف — با «ادامه» از سر گرفته می‌شود",
+    "skipped": "رد شد",
+}
+
 # The only states from which an account may be (re)started by the round loop.
 # 'running' is included because it means a turn was interrupted, not finished.
 # Everything else — done, failed, stopped, skipped, floodwait — is either
@@ -387,9 +397,22 @@ async def _run(customer_id, job_id) -> None:
                 db.get_customer(customer_id), "tg_multi_waiting", [
                     cards.kv("Job", job_id),
                     cards.kv("Resumes in", f"{int(wait)}s"),
-                    "همهٔ اکانت‌های باقی‌مانده در محدودیت تلگرام هستند. کار "
-                    "متوقف نشده — بعد از پایان محدودیت خودش ادامه می‌دهد.",
                 ], platform="Telegram")
+            # The customer needs this one most of all: at this moment NOTHING is
+            # moving, and without a word the send looks dead rather than paused.
+            if _bot:
+                try:
+                    await _bot.send_message(int(customer_id), cards.card(
+                        "⏳ ارسال در انتظار است", [
+                            cards.kv("Resumes in", _human_wait(wait)),
+                            cards.LINE,
+                            "همهٔ اکانت‌های باقی‌مانده الان در محدودیت موقت "
+                            "تلگرام هستند. ارسال متوقف یا لغو نشده — به‌صورت "
+                            "خودکار بعد از پایان محدودیت ادامه پیدا می‌کند. "
+                            "لازم نیست کاری بکنی.",
+                        ]))
+                except Exception:      # noqa: BLE001
+                    pass
             if not await _sleep_unless_stopped(control, wait + 2):
                 break
             db.tgm_wake_cooled(customer_id, job_id)
@@ -420,6 +443,101 @@ async def _run(customer_id, job_id) -> None:
     finally:
         _controls.pop(job_id, None)
         _tasks.pop(job_id, None)
+
+
+def _human_wait(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return f"{seconds} ثانیه"
+    if seconds < 3600:
+        return f"{seconds // 60} دقیقه"
+    hours, minutes = divmod(seconds // 60, 60)
+    return f"{hours} ساعت" + (f" و {minutes} دقیقه" if minutes else "")
+
+
+# What each end-of-turn actually MEANS to the customer, and what happens next.
+#
+# Written from the customer's side on purpose. "error_burst" or "FloodWait 43200"
+# tells them nothing; "این اکانت به سقف خطا رسید" plus what the system is going to
+# do about it is the difference between a person who waits and a person who
+# panics, stops the job and starts it again — which is what gets accounts
+# reported.
+_TURN_END_FA = {
+    "done": ("✅ تمام شد",
+             "این اکانت به همهٔ مخاطبانش رسید و نوبت به اکانت بعدی رسید."),
+    "floodwait": ("⏳ محدودیت موقت تلگرام",
+                  "تلگرام از این اکانت خواست کمی صبر کند. ارسال متوقف نشده — "
+                  "نوبت به اکانت بعدی رفت و این اکانت بعد از پایان محدودیت "
+                  "خودش از همان‌جا ادامه می‌دهد."),
+    "gave_up": ("⚠️ کنار گذاشته شد",
+                "این اکانت چند بار پشت‌سرهم محدود شد. ادامه دادن با آن فقط "
+                "محدودیت را بیشتر می‌کند، پس مخاطبان باقی‌ماندهٔ همین اکانت "
+                "ارسال نشدند. بقیهٔ اکانت‌ها کارشان را کردند."),
+    "auth_failed": ("🔴 اکانت از کار افتاد",
+                    "سشن این اکانت باطل شده — یعنی از تلگرام خارج یا محدود شده "
+                    "است. باید دوباره وارد شود. نوبت به اکانت بعدی رفت."),
+    "error_burst": ("⛔ خطاهای پشت‌سرهم",
+                    "این اکانت چند خطای پشت‌سرهم داد و برای سلامت خودش کنار "
+                    "گذاشته شد. نوبت به اکانت بعدی رفت؛ با دکمهٔ «ادامه» می‌توانی "
+                    "دوباره امتحان کنی."),
+    "stopped": ("⏹ متوقف شد",
+                "ارسال این اکانت به‌درخواست شما یا توسط مدیر متوقف شد."),
+}
+
+
+async def _tell_customer_turn_ended(customer_id, job_id, phone: str,
+                                    outcome: str, *, sent: int, failed: int,
+                                    skipped: int, total: int,
+                                    resumes_in: float = None,
+                                    left_unsent: int = 0,
+                                    uncertain: int = 0) -> None:
+    """One clean card to the CUSTOMER explaining why the turn ended.
+
+    This has to reach the customer, not only the owner's log group. The parked /
+    gave-up notices were logged with logbus.customer_action, which posts to the
+    log group and only mirrors to the customer when mirror=True — it was never
+    passed, so the person actually waiting on the send saw an account quietly turn
+    into ⏳ with no explanation anywhere.
+    """
+    title, explanation = _TURN_END_FA.get(
+        outcome, ("ℹ️ پایان نوبت این اکانت", "نوبت به اکانت بعدی رفت."))
+    rows = [
+        cards.kv("Account", phone),
+        cards.kv("Sent", f"{cards.num(sent)} از {cards.num(total)}"),
+    ]
+    if failed:
+        rows.append(cards.kv("Failed", cards.num(failed)))
+    if skipped:
+        rows.append(cards.kv("Skipped", cards.num(skipped)))
+    if left_unsent:
+        rows.append(cards.kv("Not sent", cards.num(left_unsent)))
+    if uncertain:
+        rows.append(cards.kv("Uncertain", cards.num(uncertain)))
+        rows.append("«Uncertain» یعنی ارسال شروع شد ولی نتیجه‌اش معلوم نشد؛ "
+                    "ممکن است رسیده باشد.")
+    if resumes_in is not None:
+        rows.append(cards.kv("Resumes in", _human_wait(resumes_in)))
+    rows.append(cards.LINE)
+    rows.append(explanation)
+
+    text = cards.card(title, rows)
+    # The log group keeps the machine-readable trail; the customer gets the plain
+    # explanation above.
+    await logbus.customer_action(db.get_customer(customer_id),
+                                "tg_multi_turn_ended", [
+        cards.kv("Job", job_id), cards.kv("Phone", phone),
+        cards.kv("Outcome", outcome), cards.kv("Sent", cards.num(sent)),
+        cards.kv("Failed", cards.num(failed)),
+        cards.kv("Skipped", cards.num(skipped)),
+        cards.kv("NotSent", cards.num(left_unsent)),
+        cards.kv("Uncertain", cards.num(uncertain)),
+    ], platform="Telegram")
+    if not _bot:
+        return
+    try:
+        await _bot.send_message(int(customer_id), text)
+    except Exception:      # noqa: BLE001 - a notice is never worth failing a send
+        pass
 
 
 async def _sleep_unless_stopped(control: dict, seconds: float,
@@ -594,26 +712,17 @@ async def _run_account(customer_id, job_id, account: dict, control: dict) -> Non
                     f"{reason} — throttled {rounds} times, giving up")
                 db.tgm_bump_job(customer_id, job_id, skipped=gave_up,
                                 uncertain=uncertain)
-                await logbus.customer_action(
-                    db.get_customer(customer_id), "tg_multi_account_gave_up", [
-                        cards.kv("Job", job_id),
-                        cards.kv("Phone", phone),
-                        cards.kv("Reason", reason),
-                        cards.kv("Rounds", rounds),
-                        cards.kv("Skipped", cards.num(gave_up)),
-                        cards.kv("Uncertain", cards.num(uncertain)),
-                    ], platform="Telegram")
+                await _tell_customer_turn_ended(
+                    customer_id, job_id, phone, "gave_up",
+                    sent=sent, failed=failed, skipped=skipped,
+                    total=int(account.get("total") or 0),
+                    left_unsent=gave_up, uncertain=uncertain)
             else:
-                await logbus.customer_action(
-                    db.get_customer(customer_id), "tg_multi_account_parked", [
-                        cards.kv("Job", job_id),
-                        cards.kv("Phone", phone),
-                        cards.kv("Reason", reason),
-                        cards.kv("Round", f"{rounds}/{MAX_FLOODWAIT_ROUNDS}"),
-                        cards.kv("Sent", cards.num(sent)),
-                        "این اکانت موقتاً کنار گذاشته شد و بعد از پایان محدودیت "
-                        "خودش ادامه می‌دهد. بقیهٔ اکانت‌ها متوقف نمی‌شوند.",
-                    ], platform="Telegram")
+                await _tell_customer_turn_ended(
+                    customer_id, job_id, phone, "floodwait",
+                    sent=sent, failed=failed, skipped=skipped,
+                    total=int(account.get("total") or 0),
+                    resumes_in=flood_seconds)
         else:
             db.tgm_update_account(customer_id, job_id, account_id,
                                  sent_count=sent, failed_count=failed,
@@ -623,6 +732,14 @@ async def _run_account(customer_id, job_id, account: dict, control: dict) -> Non
                                         "stopped": "stopped"}.get(stop_reason,
                                                                   "done"),
                                  last_error=stop_reason)
+            # Every other way a turn can end also gets explained. A silent switch
+            # to the next account is what made the customer think the send had
+            # died — and a customer who thinks that stops the job and starts it
+            # again, which double-messages people and gets accounts reported.
+            await _tell_customer_turn_ended(
+                customer_id, job_id, phone, stop_reason or "done",
+                sent=sent, failed=failed, skipped=skipped,
+                total=int(account.get("total") or 0))
         if sent:
             db.tg_incr_sent(customer_id, account_id, sent)
             db.incr_customer_sends(customer_id, sent)
@@ -857,6 +974,12 @@ def progress_card(customer_id, job_id) -> str:
                 f"✉️{cards.num(acc_sent)} / {cards.num(acc_total)}")
         if seen.get("failed"):
             line += f"  ⚠️{cards.num(seen['failed'])}"
+        # The state in words, not just a coloured dot. "🔴 0912… → ✉️0/340" gives
+        # the customer no idea that the session is dead and a fresh login is what
+        # fixes it.
+        note = _ACCOUNT_NOTE_FA.get(account.get("state"))
+        if note:
+            line += f"  · {note}"
         rows.append(line)
     return cards.panel_card("📨 - #tg_multi_send", rows)
 
