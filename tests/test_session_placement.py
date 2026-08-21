@@ -300,17 +300,44 @@ def test_the_channel_flow_repairs_the_session_on_auth_failure():
         "an INVALID_AUTH here is usually a misplaced session, not a dead account"
 
 
+def _function_source(filename: str, header: str) -> str:
+    """One whole function, sliced to where it actually ends.
+
+    Both checks below used a fixed byte window — body[start:start + 1800] — and
+    that is a trap this repo has already been bitten by: the window silently stops
+    covering the function the moment the code grows, and then reports a fix that
+    is plainly present as missing. It happened again when _step_token gained its
+    verification step. Slice to the next top-level definition instead.
+    """
+    body = _src(filename)
+    start = body.index(header)
+    rest = body[start + len(header):]
+    end = len(rest)
+    for marker in ("\nasync def ", "\ndef ", "\nclass "):
+        at = rest.find(marker)
+        if at != -1:
+            end = min(end, at)
+    return header + rest[:end]
+
+
 def test_collect_targets_repairs_the_session_too():
-    body = _src("rubika_panel.py")
-    start = body.index("async def _collect_targets")
-    section = body[start:start + 1600]
+    section = _function_source("rubika_panel.py", "async def _collect_targets")
     assert "run_with_repair" in section, \
         "zero contacts is the same missing session, one symptom later"
 
 
 def test_token_login_actually_writes_the_session_file():
-    body = _src("rubika_panel.py")
-    start = body.index("async def _step_token")
-    section = body[start:start + 1800]
+    section = _function_source("rubika_panel.py", "async def _step_token")
     assert "session_store.place" in section, \
         "storing the values in the database is not a login"
+
+
+def test_token_login_verifies_before_creating_the_account():
+    """A token that cannot work must never become an account row."""
+    section = _function_source("rubika_panel.py", "async def _step_token")
+    verify_at = section.index("_verify_session_token")
+    add_at = section.index("db.add_account")
+    assert verify_at < add_at, \
+        ("the old order created the account, wrote the blob and reported "
+         "'Status: SUCCESS' without ever connecting — so a dead token produced a "
+         "healthy-looking account that failed on its first campaign")

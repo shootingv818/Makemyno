@@ -2395,11 +2395,13 @@ async def _step_phone(event, st):
     phone = _normalize_phone_input(event.raw_text)
     if not phone:
         if _looks_like_session_token(event.raw_text):
-            await _respond(event, cards.card("این یک توکن سشن است، نه شماره", [
-                "برای ورود با توکن، از لیست اکانت‌ها گزینهٔ ورود با توکن سشن را "
-                "بزن و توکن را همان‌جا بفرست.",
-                "اینجا فقط شمارهٔ موبایل لازم است، مثل 09123456789.",
-            ]), buttons=[_back(b"rb")])
+            # Handle it here rather than sending the customer away. They pasted a
+            # valid credential; refusing it on a technicality and telling them to
+            # find another button is how a 240-digit "phone number" reached
+            # Rubika and came back INVALID_INPUT with the whole token in the log.
+            await _respond(event, cards.card("این توکن سشن است، نه شماره", [
+                "با همین توکن واردت می‌کنم — لازم نیست جای دیگری بروی."]))
+            await _step_token(event, st)
             return
         await _respond(event, "شماره خوانده نشد. با کد کشور بفرست، مثل 09123456789.")
         return
@@ -2445,29 +2447,99 @@ async def _step_password(event, st):
 
 async def _step_token(event, st):
     uid = event.sender_id
-    _state.pop(uid, None)
-    values = db.session_unpack((event.raw_text or "").strip())
-    if not values or not values.get("phone"):
-        await _respond(event, cards.card("توکن نامعتبر بود", [
-            "توکن باید با MMSESS: شروع شود."]), buttons=[_back(b"rb")])
+    raw = (event.raw_text or "").strip()
+
+    # Validate the token BEFORE anything is written, and keep the customer in
+    # this step on every failure so they can simply paste again. The old version
+    # popped the state and answered "توکن باید با MMSESS: شروع شود" for EVERY
+    # problem — including a perfectly formatted token that was missing its auth —
+    # so the one message people saw never matched what was actually wrong.
+    def _retry(*rows):
+        _state[uid] = {"step": "rb_token"}
+        return _respond(event, cards.card("توکن پذیرفته نشد", list(rows)),
+                        buttons=[_back(b"rb")])
+
+    values = db.session_unpack(raw)
+    if not values:
+        await _retry("این متن یک توکن سشن نیست.",
+                     "توکن با MMSESS: شروع می‌شود و از دکمهٔ «🔑 توکن سشن» روی "
+                     "همان اکانت گرفته می‌شود.",
+                     "دوباره بفرست یا لغو کن.")
         return
+    missing = [name for name in ("phone", "auth", "private_key")
+               if not values.get(name)]
+    if missing:
+        # Naming the missing field matters: a token with no private_key can READ
+        # but can never SIGN, so it would be accepted here and then fail every
+        # channel creation and every send with INVALID_AUTH — days later, looking
+        # like a completely unrelated bug.
+        await _retry(cards.kv("Missing", ", ".join(missing)),
+                     "این توکن کامل نیست و با آن نمی‌شود کار کرد.",
+                     "توکن را کامل و بدون بریدگی کپی کن و دوباره بفرست.")
+        return
+
+    _state.pop(uid, None)
     phone = rb.normalize_phone(values["phone"])
+    values["phone"] = phone
     display = "0" + phone[2:] if phone.startswith("98") else phone
+
+    if db.get_account_by_phone(uid, display):
+        await _respond(event, cards.card("این شماره از قبل هست", [
+            cards.kv("Phone", display),
+            "اگر از کار افتاده، از لیست اکانت‌ها «ورود مجدد» را بزن.",
+        ]), buttons=[_back(b"rbaccs")])
+        return
+
+    msg = await _respond(event, cards.card("🔑 ورود با توکن سشن", [
+        cards.kv("Phone", display), "⏳ بررسی توکن ..."]))
+
+    # PROVE the session works before an account row exists for it.
+    #
+    # This used to create the account, store the blob, write the session file and
+    # report "Status: SUCCESS / Session Saved: YES" without ever connecting. A
+    # dead or truncated token therefore produced a perfectly healthy-looking
+    # account that failed on its first real operation with INVALID_AUTH — and the
+    # customer had no reason to suspect the token, because the login had said
+    # SUCCESS. The reference verifies first and REFUSES, which is the whole
+    # difference.
     w = await worker.pick_worker_for_login()
+    try:
+        name, guid, contacts = await _verify_session_token(uid, w, phone, values)
+    except Exception as exc:  # noqa: BLE001
+        code = await logbus.error(exc, context=f"rb token login {display}",
+                                  customer=uid)
+        text = cards.card("❌ ورود با توکن انجام نشد", [
+            cards.kv("Phone", display),
+            cards.kv("کد خطا", code, width=8),
+            cards.LINE,
+            "این توکن پذیرفته نشد. اگر مطمئنی درست کپی شده، با کد ورود "
+            "وارد شو.",
+        ])
+        try:
+            await msg.edit(text, buttons=[_back(b"rb")])
+        except Exception:
+            await _respond(event, text, buttons=[_back(b"rb")])
+        return
+
+    if name:
+        values["name"] = name
+    if guid:
+        values["guid"] = str(guid)
     aid = db.add_account(uid, display, name=values.get("name") or "",
                          worker_id=(w or {}).get("id"))
     db.set_session_blob(uid, aid, values)
 
-    # ACTUALLY WRITE THE SESSION FILE. Storing the five values in the database
-    # and stopping there is what made a token login report "Session Saved: YES"
-    # while no server had a session for the account at all — so the first real
-    # operation connected unauthenticated and answered INVALID_AUTH.
+    # Write the session file where the work will run. Storing the five values in
+    # the database and stopping there is what made a token login report
+    # "Session Saved: YES" while no server had a session for the account at all.
     import session_store
     placed = await session_store.place(uid, db.get_account(uid, aid))
     rows = [
         cards.kv("Status", "SUCCESS"),
         cards.kv("Phone", display),
         cards.kv("Login Method", "SESSION"),
+        cards.kv("Verified", "YES"),
+        cards.kv("Contacts", cards.num(contacts)),
         cards.kv("Session Saved", "YES" if placed else "NO"),
         cards.kv("Time", cards.now()),
     ]
@@ -2480,6 +2552,50 @@ async def _step_token(event, st):
                                           footer=footer),
                    buttons=[[Button.inline("🚀 ارسال", f"rbrun_{aid}".encode())],
                             _back(b"rb")])
+
+
+async def _verify_session_token(customer_id, w, phone: str, values: dict):
+    """Prove a pasted session actually works. Returns (name, guid, contacts).
+
+    Raises when the session is not usable, so the caller never creates an account
+    row for a token that cannot work. Two paths, both taken from the reference:
+
+      LOCAL  — write the session, connect once, call get_me() and read the
+               contact list, then disconnect. get_me is a signed call, so it
+               proves the private_key is present and usable, not merely that the
+               file exists.
+      REMOTE — push the session to the worker (write-only, never connects, so it
+               cannot provoke AUTH_FROM_ANOTHER) and then ask the worker's
+               /account/verify. If the worker says the session is dead we refuse
+               here instead of discovering it on the customer's first campaign.
+    """
+    import account_conn
+
+    if w and not worker.is_local(w):
+        pushed = await worker.push_session(w, customer_id, phone, values)
+        if not pushed:
+            raise RuntimeError(
+                f"worker {w.get('tag')} could not store the session: "
+                f"{worker.last_push_error() or 'no reason reported'}")
+        verdict = await worker.api_call(w, "POST", "/account/verify", {
+            "customer_id": customer_id, "phone": phone}, timeout=120)
+        if verdict.get("dead"):
+            raise RuntimeError("Rubika rejected this session (it is expired or "
+                               "was revoked)")
+        # skipped=True means the worker could not reach a conclusion — treat it
+        # as unproven rather than as proof of health, but do not fail the login
+        # over an inconclusive probe.
+        return (values.get("name") or "", values.get("guid") or "", 0)
+
+    # Local: import write-only first, then one connection that proves it signs.
+    if not rb.import_session(phone, customer_id, values):
+        raise RuntimeError("the session could not be written on this server")
+    async with account_conn.fresh_connection(customer_id, phone) as client:
+        me = await client.get_me()
+        guid = rb._guid_of(me) or values.get("guid") or ""   # noqa: SLF001
+        name = rb._name_of(me, "") or ""                     # noqa: SLF001
+        contacts = len(await rb.get_contacts_full(client))
+    return name, guid, contacts
 
 
 async def _step_contacts_file(event, st):

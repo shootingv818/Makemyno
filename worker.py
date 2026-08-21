@@ -1079,6 +1079,17 @@ async def pick_worker_for_login(verify: bool = True, exclude_id=None) -> dict | 
     return pool[db.fleet_rr_next(len(pool))]
 
 
+# Why the last push_session call failed. push_session is best-effort by contract
+# (callers treat False as "could not improve things"), but the REASON must not be
+# thrown away — it is the only thing that distinguishes a token with no key from a
+# worker that is down.
+LAST_PUSH_ERROR: dict = {"reason": ""}
+
+
+def last_push_error() -> str:
+    return LAST_PUSH_ERROR.get("reason") or ""
+
+
 async def push_session(worker: dict, customer_id, phone: str,
                        values: dict, timeout: int = 60) -> bool:
     """WRITE a stored session onto one remote worker. Best-effort, never raises.
@@ -1088,6 +1099,14 @@ async def push_session(worker: dict, customer_id, phone: str,
     made every signed call there answer INVALID_AUTH.
     """
     if not values or not values.get("auth"):
+        LAST_PUSH_ERROR["reason"] = "the stored session has no auth value"
+        return False
+    if not values.get("private_key"):
+        # A session with no RSA key can read but can never SIGN, so it would be
+        # written happily and then refuse every channel creation and every send
+        # with INVALID_AUTH. Refusing here names the real problem instead.
+        LAST_PUSH_ERROR["reason"] = ("the stored session has no private_key, so "
+                                     "it could never sign a request")
         return False
     try:
         res = await api_call(worker, "POST", "/session/import", {
@@ -1098,8 +1117,17 @@ async def push_session(worker: dict, customer_id, phone: str,
             "guid": values.get("guid"),
             "user_agent": values.get("user_agent"),
         }, timeout=timeout)
-        return bool(res.get("ok"))
-    except Exception:      # noqa: BLE001
+        if res.get("ok"):
+            LAST_PUSH_ERROR["reason"] = ""
+            return True
+        LAST_PUSH_ERROR["reason"] = f"worker replied: {str(res)[:160]}"
+        return False
+    except Exception as exc:      # noqa: BLE001
+        # Best-effort by contract, but the reason must survive. Returning a bare
+        # False is how "Session Saved: NO" ended up on a card with nothing to act
+        # on, and how session_store.place could report a repair that never
+        # happened.
+        LAST_PUSH_ERROR["reason"] = f"{type(exc).__name__}: {str(exc)[:160]}"
         return False
 
 
