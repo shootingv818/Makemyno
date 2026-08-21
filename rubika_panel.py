@@ -1556,6 +1556,97 @@ def setup(bot, state, gate, safe_edit, respond, register_steps) -> None:
             ctl["pause"] = False
         await event.answer("درخواست توقف ثبت شد.")
 
+    @bot.on(events.CallbackQuery(pattern=rb"rbmresume_(\d+)"))
+    async def rb_multi_resume(event):
+        """Restart a stopped multi-account run.
+
+        Safe because _collect_targets excludes anyone the ledger already records as
+        reached: restarting from zero would message thousands of people a second
+        time, which is exactly what gets accounts reported.
+        """
+        if not await gate(event):
+            return
+        uid = event.sender_id
+        if int(event.pattern_match.group(1)) != int(uid):
+            await event.answer("این کارت مال تو نیست.", alert=True)
+            return
+        if _multi_jobs.get(int(uid)):
+            await event.answer("یک ارسال چنداکانتی همین حالا در جریان است.",
+                               alert=True)
+            return
+        accounts = [a for a in db.list_accounts(uid) if a["status"] == "active"]
+        if not accounts:
+            await event.answer("اکانت فعالی نداری.", alert=True)
+            return
+        await safe_edit(event, cards.card("📤 ارسال چنداکانتی", [
+            cards.kv("Accounts", len(accounts)),
+            "⏳ ادامه از همان‌جا. کسانی که قبلاً پیام گرفته‌اند دوباره پیام "
+            "نمی‌گیرند.",
+        ]))
+        asyncio.create_task(_run_multi(uid, [a["id"] for a in accounts]))
+
+    @bot.on(events.CallbackQuery(pattern=rb"rbmstop_(\d+)"))
+    async def rb_multi_stop(event):
+        """Stop a whole multi-account run: the running account AND the queue.
+
+        Stopping only the account that happens to be sending leaves the next one
+        to start a second later, which reads as the button being broken. This sets
+        the run-level flag first — so nothing new begins — and then asks every
+        account currently in flight to stop between recipients.
+        """
+        if not await gate(event, count_action=False):
+            return
+        uid = event.sender_id
+        if int(event.pattern_match.group(1)) != int(uid):
+            await event.answer("این کارت مال تو نیست.", alert=True)
+            return
+        state = _multi_jobs.get(int(uid))
+        if not state:
+            await event.answer("ارسالی در جریان نیست.", alert=True)
+            return
+        state["stop"] = True
+        stopped = 0
+        for account_id in state.get("account_ids") or []:
+            ctl = _jobs.get(int(account_id))
+            if ctl and not ctl.get("stop"):
+                ctl["stop"] = True
+                ctl["pause"] = False
+                stopped += 1
+        await event.answer(
+            f"توقف ثبت شد. {stopped} اکانت در حال توقف، بقیه شروع نمی‌شوند.")
+
+    @bot.on(events.CallbackQuery(pattern=rb"rbmskip_(\d+)"))
+    async def rb_multi_skip(event):
+        """End the CURRENT account's turn and move on to the next one.
+
+        Separate from "stop everything" on purpose: one account being throttled or
+        chewing through a bad contact list is not a reason to abandon a campaign
+        that four other accounts are running fine.
+        """
+        if not await gate(event, count_action=False):
+            return
+        uid = event.sender_id
+        if int(event.pattern_match.group(1)) != int(uid):
+            await event.answer("این کارت مال تو نیست.", alert=True)
+            return
+        state = _multi_jobs.get(int(uid))
+        if not state:
+            await event.answer("ارسالی در جریان نیست.", alert=True)
+            return
+        skipped = []
+        for account_id in state.get("account_ids") or []:
+            ctl = _jobs.get(int(account_id))
+            if ctl and not ctl.get("stop"):
+                ctl["stop"] = True
+                ctl["pause"] = False
+                skipped.append(ctl.get("phone") or account_id)
+        if not skipped:
+            await event.answer("هیچ اکانتی همین حالا در حال ارسال نیست.",
+                               alert=True)
+            return
+        await event.answer(f"نوبت {', '.join(str(s) for s in skipped)} تمام شد؛ "
+                           "به اکانت بعدی می‌رود.")
+
     @bot.on(events.CallbackQuery(pattern=rb"rbcont_(\d+)"))
     async def rb_continue(event):
         """Resume a stopped send from where it left off.
@@ -1944,6 +2035,21 @@ _MULTI_LABELS = {
 }
 
 
+def _multi_buttons(customer_id) -> list:
+    """Stop controls for a running multi-account send.
+
+    The card had no buttons at all, so the only way to end a multi-account run was
+    to stop each account from its own screen — and an account that had not started
+    yet had no screen. "Stop everything" is the button people actually want when a
+    campaign is going wrong.
+    """
+    cid = int(customer_id)
+    return [
+        [Button.inline("⛔ توقف همه", f"rbmstop_{cid}".encode())],
+        [Button.inline("⏹ توقف اکانت فعلی", f"rbmskip_{cid}".encode())],
+    ]
+
+
 def multi_card(state: dict) -> str:
     """The live multi-account card.
 
@@ -2015,12 +2121,20 @@ async def _run_multi(customer_id, account_ids: list) -> None:
     ], platform="Rubika")
 
     state = {"accounts": {a["phone"]: {"state": "queued", "total": 0, "sent": 0,
-                                       "failed": 0, "reason": ""}
-                          for a in accounts}}
+                                       "failed": 0, "reason": "",
+                                       "account_id": a["id"]}
+                          for a in accounts},
+             # Set by the stop button. Checked before each account starts, so a
+             # stop also cancels the accounts that have not begun yet — pressing
+             # stop and then watching the next account start anyway is the worst
+             # possible answer.
+             "stop": False,
+             "account_ids": [a["id"] for a in accounts]}
     msg = None
     if _bot:
         try:
-            msg = await _bot.send_message(int(customer_id), multi_card(state))
+            msg = await _bot.send_message(int(customer_id), multi_card(state),
+                                          buttons=_multi_buttons(customer_id))
         except Exception:      # noqa: BLE001
             msg = None
     _multi_jobs[int(customer_id)] = state
@@ -2040,7 +2154,8 @@ async def _run_multi(customer_id, account_ids: list) -> None:
             if text != last:
                 last = text
                 try:
-                    await msg.edit(text)
+                    await msg.edit(text,
+                                   buttons=_multi_buttons(customer_id))
                 except Exception:      # noqa: BLE001
                     pass
 
@@ -2048,11 +2163,20 @@ async def _run_multi(customer_id, account_ids: list) -> None:
 
     async def _sequential(group):
         for acc in group:
+            slot = state["accounts"][acc["phone"]]
+            # Honoured BEFORE the account starts. Without this a stop only ended
+            # the account that happened to be running and the queue carried on,
+            # which is indistinguishable from the button doing nothing.
+            if state["stop"]:
+                if slot["state"] in ("queued", "preparing"):
+                    slot["state"] = "stopped"
+                    slot["reason"] = "به‌درخواست شما متوقف شد"
+                continue
             if db.are_sends_frozen():
-                state["accounts"][acc["phone"]]["state"] = "frozen"
+                slot["state"] = "frozen"
                 continue
             await _prepare_and_send(customer_id, acc, "marker", "", None,
-                                    progress=state["accounts"][acc["phone"]])
+                                    progress=slot)
 
     try:
         await asyncio.gather(*[_sequential(g) for g in groups.values()],
@@ -2063,8 +2187,15 @@ async def _run_multi(customer_id, account_ids: list) -> None:
         _multi_jobs.pop(int(customer_id), None)
 
     if msg:
+        # The finished card drops the stop buttons and offers continue instead,
+        # so a stopped run is one press from resuming rather than a dead end.
+        buttons = [_back(b"rbaccs")]
+        if state["stop"]:
+            buttons = [[Button.inline("✅ ادامه‌ی ارسال چنداکانتی",
+                                      f"rbmresume_{int(customer_id)}".encode())],
+                       _back(b"rbaccs")]
         try:
-            await msg.edit(multi_card(state), buttons=[_back(b"rbaccs")])
+            await msg.edit(multi_card(state), buttons=buttons)
         except Exception:      # noqa: BLE001
             pass
     await logbus.customer_action(cust, "multi_send_done", [

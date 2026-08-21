@@ -227,8 +227,10 @@ def test_the_multi_runner_creates_and_refreshes_one_card():
     # nested `async def _refresh` definition and survived deleting the create_task.
     assert "asyncio.create_task(_refresh())" in code, \
         "a card that is never refreshed is not live"
-    assert "progress=state[" in code, \
+    assert "progress=slot" in code, \
         "each account must write into the shared card state"
+    assert 'slot = state["accounts"][acc["phone"]]' in code, \
+        "the slot handed to the account must be the card's own dict"
 
 
 def test_prepare_and_send_fills_the_progress_slot():
