@@ -166,6 +166,12 @@ def test_owner_only_readers_are_named_with_the_owner_prefix():
         "init", "schema_version", "monotonic_now", "clock_tampered",
         "get_bot_state", "is_bot_online", "set_bot_online", "are_sends_frozen",
         "set_sends_frozen", "record_start", "recent_start_count",
+        # the sponsor-channel lock is ONE list that applies to every customer, so
+        # scoping it per customer would be wrong, not merely unnecessary. It lives
+        # in db rather than central_db because the customer bot has to read it and
+        # must not import central_db.
+        "add_forced_channel", "list_forced_channels", "get_forced_channel",
+        "set_forced_channel_enabled", "delete_forced_channel",
         # the health sweep is service-wide, and its result is handed to the owner
         # bot through the shared state row rather than in memory
         "set_health_report", "get_health_report",

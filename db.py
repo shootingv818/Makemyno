@@ -254,6 +254,24 @@ def init() -> None:
             health_at     TEXT DEFAULT ''
         )
     """)
+    # Sponsor channels every customer must join before using the bot.
+    #
+    # It lives HERE and not in central_db on purpose. The owner bot writes it and
+    # the customer bot reads it, and owner_bot's own docstring records the rule
+    # that the customer bot must not import central_db — that separation is what
+    # keeps the worker fleet, the roster and the backup out of the customer
+    # process. Every other owner-set global flag (online, sends_frozen,
+    # maintenance) is shared through this database for the same reason.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS forced_channels (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat     TEXT UNIQUE,
+            title    TEXT,
+            link     TEXT,
+            enabled  INTEGER DEFAULT 1,
+            added_at TEXT
+        )
+    """)
     c.execute("INSERT OR IGNORE INTO bot_state (id, online) VALUES (1, 1)")
     # CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so
     # a column added in a later version never appears on an existing database and
@@ -1572,6 +1590,54 @@ def set_bot_online(online: bool, by: str = "", note: str = "") -> None:
         "UPDATE bot_state SET online = ?, offline_by = ?, offline_at = ?, "
         "offline_note = ? WHERE id = 1",
         (1 if online else 0, by or "", "" if online else _now(), note or ""))
+    conn.commit()
+    conn.close()
+
+
+def add_forced_channel(chat: str, title: str = "", link: str = "") -> bool:
+    """Add a sponsor channel. False when it is already listed."""
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT INTO forced_channels (chat, title, link, enabled, added_at) "
+            "VALUES (?, ?, ?, 1, ?)", (chat, title or chat, link or "", _now()))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+
+def list_forced_channels(only_enabled: bool = False) -> list:
+    conn = _conn()
+    sql = "SELECT * FROM forced_channels"
+    if only_enabled:
+        sql += " WHERE enabled = 1"
+    rows = _rows(conn.execute(sql + " ORDER BY id"))
+    conn.close()
+    return rows
+
+
+def get_forced_channel(channel_id) -> dict | None:
+    conn = _conn()
+    row = _row(conn.execute("SELECT * FROM forced_channels WHERE id = ?",
+                            (int(channel_id),)))
+    conn.close()
+    return row
+
+
+def set_forced_channel_enabled(channel_id, enabled: bool) -> None:
+    conn = _conn()
+    conn.execute("UPDATE forced_channels SET enabled = ? WHERE id = ?",
+                 (1 if enabled else 0, int(channel_id)))
+    conn.commit()
+    conn.close()
+
+
+def delete_forced_channel(channel_id) -> None:
+    conn = _conn()
+    conn.execute("DELETE FROM forced_channels WHERE id = ?", (int(channel_id),))
     conn.commit()
     conn.close()
 

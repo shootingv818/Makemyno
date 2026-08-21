@@ -41,6 +41,7 @@ import busy
 import cards
 import config
 import db
+import forcedjoin
 import logbus
 import ratelimit
 
@@ -146,7 +147,15 @@ async def _gate(event, *, need_active: bool = True,
 
     db.touch_customer(uid)
 
-    # 5. Subscription.
+    # 5. Sponsor channels. AFTER the rate limit (the check is a network call, so a
+    #    flooder must not be able to make us spend one per press) and BEFORE the
+    #    subscription check, so a customer whose time has run out still sees the
+    #    join prompt rather than two contradictory refusals at once.
+    if forcedjoin.is_active() and not await forcedjoin.enforce(
+            bot, event, respond=respond):
+        return False
+
+    # 6. Subscription.
     if need_active and not db.is_active(uid):
         left_note = ("زمان دسترسی شما تمام شده."
                      if db.get_customer(uid) else "دسترسی فعال نیست.")
@@ -265,6 +274,35 @@ async def cancel_cb(event):
         return
     state.pop(event.sender_id, None)
     await safe_edit(event, start_card(event.sender_id), buttons=start_menu())
+
+
+@bot.on(events.CallbackQuery(data=b"fj_check"))
+async def fj_check_cb(event):
+    """"I have joined — check me".
+
+    This deliberately does NOT go through _gate. _gate is what shows the join
+    prompt, so routing the prompt's own button through it would answer a customer
+    who has just joined with the same prompt again, forever. It runs the membership
+    check directly, and only then hands them the normal menu.
+
+    The cached PASS is dropped first: the customer joined seconds ago, so any
+    remembered verdict is stale by definition.
+    """
+    uid = event.sender_id
+    if db.is_blocked(uid):
+        return
+    if not await ratelimit.guard(uid, action="panel"):
+        return
+    forcedjoin.clear_cache(uid)
+    missing = await forcedjoin.missing_for(bot, uid)
+    if missing:
+        text, buttons = forcedjoin.prompt(missing, Button)
+        await event.answer("هنوز عضو همهٔ کانال‌ها نشدی.", alert=True)
+        await safe_edit(event, text, buttons=buttons)
+        return
+    db.touch_customer(uid)
+    await event.answer("✅ عضویت تأیید شد.")
+    await safe_edit(event, start_card(uid), buttons=start_menu())
 
 
 # --------------------------------------------------------------------------- #

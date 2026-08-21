@@ -200,6 +200,13 @@ CONTACT_REMOTE_CHUNK = _int("CONTACT_REMOTE_CHUNK", 25)
 # Without these two knobs the worker had no brake at all, so a rate-limit burst
 # was counted as N individual failures and the customer got "0 added" with no
 # explanation for a list that was perfectly fine.
+# ---- sponsor-channel lock ---------------------------------------------------- #
+# How long a PASSED membership check is trusted. _gate runs on every button press
+# and get_permissions is a network call, so without this a customer walking five
+# menus pays five round-trips per channel. Only passes are cached: a user who has
+# not joined is re-checked every time, because they are about to join.
+FORCED_JOIN_CACHE_SEC = _int("FORCED_JOIN_CACHE_SEC", 300)
+
 CONTACT_MAX_ERRORS = _int("CONTACT_MAX_ERRORS", 5)      # consecutive errors
 CONTACT_RESUME_WAIT = _int("CONTACT_RESUME_WAIT", 60)   # pause after the brake
 

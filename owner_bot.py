@@ -33,6 +33,7 @@ import antispam
 import backup
 import cards
 import central_db
+import forcedjoin
 import config
 import db
 import logbus
@@ -98,7 +99,8 @@ def main_menu() -> list:
          Button.inline("⏸ توقف اضطراری", b"freeze")],
         [Button.inline("🛡 سپر ضداسپم", b"shield"),
          Button.inline("⚙️ تنظیمات سرویس", b"settings")],
-        [Button.inline("📋 لاگ ممیزی", b"audit")],
+        [Button.inline("📢 قفل کانال", b"forcedjoin"),
+         Button.inline("📋 لاگ ممیزی", b"audit")],
     ]
     open_tickets = 0
     try:
@@ -1593,6 +1595,125 @@ async def settings_cb(event):
                     buttons=[_back(b"home")])
 
 
+@bot.on(events.CallbackQuery(data=b"forcedjoin"))
+async def forcedjoin_cb(event):
+    """The sponsor-channel lock: list, toggle, remove, add."""
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    channels = db.list_forced_channels()
+    rows = []
+    buttons = []
+    if not channels:
+        rows.append("هیچ کانالی تنظیم نشده — قفل خاموش است.")
+    else:
+        enabled = sum(1 for c in channels if c["enabled"])
+        rows.append(cards.kv("Channels", f"{enabled} فعال از {len(channels)}"))
+        rows.append(cards.LINE)
+        for channel in channels:
+            mark = "🟢" if channel["enabled"] else "🔴"
+            rows.append(f"{mark} {channel.get('title') or channel['chat']}  "
+                        f"({channel['chat']})")
+            buttons.append([
+                Button.inline("🔴 خاموش" if channel["enabled"] else "🟢 روشن",
+                              f"fjtog_{channel['id']}".encode()),
+                Button.inline("🗑 حذف", f"fjdel_{channel['id']}".encode()),
+            ])
+    rows.append(cards.LINE)
+    rows.append("⚠️ ربات مشتری باید ادمین هر کانال باشد، وگرنه تلگرام اجازهٔ "
+                "خواندن عضویت نمی‌دهد.")
+    rows.append("کانالی که قابل بررسی نباشد نادیده گرفته می‌شود و کسی را متوقف "
+                "نمی‌کند — تا یک تنظیم غلط همهٔ مشتری‌ها را بیرون نگذارد.")
+    buttons.append([Button.inline("➕ افزودن کانال", b"fj_add")])
+    buttons.append([Button.inline("🧪 تست قفل", b"fj_test")])
+    buttons.append(_back(b"home"))
+    await safe_edit(event, cards.card("📢 قفل کانال", rows), buttons=buttons)
+
+
+@bot.on(events.CallbackQuery(data=b"fj_add"))
+async def fj_add_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_fj_channel"}
+    await safe_edit(event, cards.card("➕ افزودن کانال", [
+        "یوزرنیم کانال را بفرست. هر شکلی قبول است:",
+        "@mychannel  یا  t.me/mychannel  یا لینک کامل",
+        cards.LINE,
+        "⚠️ اول ربات مشتری را ادمین آن کانال کن، بعد اضافه‌اش کن — همان‌جا "
+        "بررسی می‌کنم که دسترسی دارد یا نه.",
+    ]), buttons=[[Button.inline("🔙 لغو", b"forcedjoin")]])
+
+
+@bot.on(events.CallbackQuery(pattern=rb"fjtog_(\d+)"))
+async def fjtog_cb(event):
+    if not is_owner(event):
+        return
+    channel_id = int(event.pattern_match.group(1))
+    channel = db.get_forced_channel(channel_id)
+    if channel:
+        db.set_forced_channel_enabled(channel_id,
+                                             not channel["enabled"])
+        # Cached passes are stale the moment the list changes: without this,
+        # turning a channel OFF would leave customers blocked by it and turning
+        # one ON would let everybody through until the cache expired.
+        forcedjoin.clear_cache()
+    await forcedjoin_cb(event)
+
+
+@bot.on(events.CallbackQuery(pattern=rb"fjdel_(\d+)"))
+async def fjdel_cb(event):
+    if not is_owner(event):
+        return
+    db.delete_forced_channel(int(event.pattern_match.group(1)))
+    forcedjoin.clear_cache()
+    await forcedjoin_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"fj_test"))
+async def fj_test_cb(event):
+    """Prove, per channel, whether the customer bot can read membership.
+
+    This is the subsystem the owner cannot test by hand: the lock's failure mode
+    is SILENT — an unreadable channel is skipped so nobody is wrongly locked out,
+    which also means a lock that protects nothing looks exactly like one that
+    works.
+    """
+    if not is_owner(event):
+        return
+    channels = db.list_forced_channels()
+    if not channels:
+        await event.answer("کانالی تنظیم نشده.", alert=True)
+        return
+    rows = []
+    working = 0
+    me = None
+    try:
+        me = await bot.get_me()
+    except Exception as exc:      # noqa: BLE001
+        rows.append(cards.kv("Bot", f"شناسایی نشد: {type(exc).__name__}"))
+    for channel in channels:
+        state_mark = "🔴 خاموش" if not channel["enabled"] else None
+        if state_mark:
+            rows.append(f"{state_mark}  {channel['chat']}")
+            continue
+        try:
+            await bot.get_permissions(channel["chat"], me.id)
+            rows.append(f"✅ {channel['chat']} — قابل بررسی")
+            working += 1
+        except Exception as exc:      # noqa: BLE001
+            rows.append(f"⚠️ {channel['chat']} — {type(exc).__name__}: "
+                        f"{str(exc)[:70]}")
+    rows.append(cards.LINE)
+    if working:
+        rows.append(f"{working} کانال واقعاً قفل می‌کند.")
+    else:
+        rows.append("⛔ هیچ کانالی قابل بررسی نیست — قفل عملاً خاموش است و همه "
+                    "رد می‌شوند. ربات مشتری را ادمین کن.")
+    await safe_edit(event, cards.card("🧪 تست قفل کانال", rows),
+                    buttons=[[Button.inline("📢 قفل کانال", b"forcedjoin")],
+                             _back(b"home")])
+
+
 @bot.on(events.CallbackQuery(data=b"audit"))
 async def audit_cb(event):
     if not is_owner(event):
@@ -1983,6 +2104,65 @@ async def _provision(owner_id: int, msg, wk: dict) -> None:
         pass
 
 
+def _clean_channel_username(raw: str) -> str:
+    """Pull a bare username out of whatever the owner pasted.
+
+    People paste @name, t.me/name, https://t.me/name and the full link with a
+    query string. Accepting only one of those forms means a lock that silently
+    never matches, which is the worst outcome for this feature: everyone is let
+    through because the channel cannot be resolved.
+    """
+    text = (raw or "").strip()
+    for prefix in ("https://", "http://", "t.me/", "telegram.me/", "www."):
+        text = text.replace(prefix, "")
+    text = text.lstrip("@").strip()
+    return text.split("/")[0].split("?")[0].strip()
+
+
+async def _step_fj_channel(event, st):
+    state.pop(event.sender_id, None)
+    username = _clean_channel_username(event.raw_text)
+    if not username:
+        await event.respond("یوزرنیم کانال خوانده نشد.",
+                            buttons=[[Button.inline("📢 قفل کانال",
+                                                    b"forcedjoin")]])
+        return
+    chat = "@" + username
+    added = db.add_forced_channel(chat, username,
+                                         f"https://t.me/{username}")
+    if not added:
+        await event.respond("این کانال از قبل در لیست است.",
+                            buttons=[[Button.inline("📢 قفل کانال",
+                                                    b"forcedjoin")]])
+        return
+    # Any cached "this user passed" verdict is now wrong: there is a new channel
+    # nobody has been checked against.
+    forcedjoin.clear_cache()
+
+    # Say whether the bot can ACTUALLY see membership, right now. Adding a channel
+    # the customer bot is not an admin of produces a lock that lets everyone
+    # through — silently, because unverifiable channels are skipped on purpose.
+    # Finding that out here beats discovering it never worked.
+    admin_note = "⚠️ بررسی نشد — ربات مشتری را ادمین کانال کن."
+    try:
+        me = await bot.get_me()
+        await bot.get_permissions(chat, me.id)
+        admin_note = "✅ ربات در این کانال دسترسی دارد."
+    except Exception as exc:      # noqa: BLE001
+        admin_note = (f"⚠️ ربات نتوانست کانال را بخواند "
+                      f"({type(exc).__name__}). تا وقتی ادمین نشود، این قفل "
+                      f"عملاً کسی را متوقف نمی‌کند.")
+
+    await logbus.event("📢 - #forced_channel_added", [
+        cards.kv("Channel", chat), cards.kv("Check", admin_note)])
+    await event.respond(cards.card("✅ کانال اضافه شد", [
+        cards.kv("Channel", chat),
+        cards.LINE,
+        admin_note,
+    ]), buttons=[[Button.inline("📢 قفل کانال", b"forcedjoin")],
+                 _back(b"home")])
+
+
 _STEPS = {
     "await_days": _step_days,
     "await_note": _step_note,
@@ -2000,6 +2180,7 @@ _STEPS = {
     "wk_port": _step_wk_port,
     "wk_user": _step_wk_user,
     "wk_pass": _step_wk_pass,
+    "await_fj_channel": _step_fj_channel,
 }
 
 
