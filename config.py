@@ -205,6 +205,12 @@ CONTACT_REMOTE_CHUNK = _int("CONTACT_REMOTE_CHUNK", 25)
 # and get_permissions is a network call, so without this a customer walking five
 # menus pays five round-trips per channel. Only passes are cached: a user who has
 # not joined is re-checked every time, because they are about to join.
+# ---- tools -------------------------------------------------------------------- #
+# Ceiling on one number-generation request. Generating is cheap, but a file of a
+# million lines is not something anyone can use and the upload alone would time
+# out — and the cap is reported to the customer rather than applied silently.
+NUMGEN_MAX = _int("NUMGEN_MAX", 5000)
+
 FORCED_JOIN_CACHE_SEC = _int("FORCED_JOIN_CACHE_SEC", 300)
 
 CONTACT_MAX_ERRORS = _int("CONTACT_MAX_ERRORS", 5)      # consecutive errors

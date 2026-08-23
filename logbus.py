@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import traceback
 import uuid
 
@@ -158,9 +159,90 @@ async def customer_action(customer, action: str, rows: list = None,
                        pv_user=cid if mirror else None)
 
 
+# A short, actionable Persian sentence per situation. Ported from the reference.
+#
+# The customer used to get "⚠️ مشکلی پیش آمد" plus an error code for EVERY failure,
+# including the ones that are entirely their own doing and instantly fixable — a
+# mistyped login code, a wrong 2FA password, a phone number with a digit missing.
+# An error code for those is worse than useless: it tells them to contact support
+# about something they could have fixed in five seconds.
+_KIND_MSG = {
+    "code": "کد تأیید اشتباه یا منقضی شده بود. دوباره شروع کن و کد تازه را سریع "
+            "وارد کن.",
+    "password": "رمز دومرحله‌ای درست نیست. دوباره امتحان کن.",
+    "login": "ورود انجام نشد. چند لحظه بعد دوباره امتحان کن؛ اگر ادامه داشت با "
+             "پشتیبانی تماس بگیر.",
+    "prepare": "آماده‌سازی ارسال انجام نشد. چند لحظه بعد دوباره امتحان کن.",
+    "export": "خروجی گرفتن انجام نشد. چند لحظه بعد دوباره امتحان کن.",
+    "generic": "مشکلی پیش آمد. چند لحظه بعد دوباره امتحان کن؛ اگر ادامه داشت با "
+               "پشتیبانی تماس بگیر.",
+}
+
+
+def platform_message(err) -> str:
+    """Rubika's OWN Persian sentence, when it sent one.
+
+    Rubika answers some refusals with a client_show_message carrying text written
+    for the end user — for example that a new account cannot be created yet
+    because the previous one was deleted too recently. We were throwing that away
+    and showing a generic apology instead, which is absurd: the platform had
+    already explained itself better than we could.
+    """
+    text = str(err or "")
+    if "client_show_message" not in text:
+        return ""
+    match = re.search(r"'message'\s*:\s*'([^']{4,400})'", text)
+    if not match:
+        match = re.search(r'"message"\s*:\s*"([^"]{4,400})"', text)
+    return match.group(1).strip() if match else ""
+
+
+def humanize_error(err, kind: str = "generic") -> str:
+    """One clean Persian sentence for a failure. Never a repr, never a traceback."""
+    platform = platform_message(err)
+    if platform:
+        return platform
+
+    try:
+        text = f"{type(err).__name__} {err!r}".lower()
+    except Exception:      # noqa: BLE001
+        text = ""
+
+    if any(k in text for k in ("codeisinvalid", "code_is_invalid", "invalid_code",
+                               "wrong_code", "phone_code_invalid",
+                               "phone_code_expired", "codeisexpired")):
+        return _KIND_MSG["code"]
+    if any(k in text for k in ("password_hash_invalid", "passwordhashinvalid",
+                               "wrong_pass", "invalid_pass", "password_invalid")):
+        return _KIND_MSG["password"]
+    # NOT_REGISTERED is not a broken session: Rubika is saying the account does
+    # not exist any more. Telling the customer to "log in again" would send them
+    # round a loop they cannot win.
+    if any(k in text for k in ("not_registered", "notregistered")):
+        return ("این شماره روی روبیکا حساب فعالی ندارد (حساب حذف یا غیرفعال "
+                "شده). با شمارهٔ دیگری وارد شو.")
+    if any(k in text for k in ("phone_number_invalid", "phonenumberinvalid",
+                               "phone_invalid", "invalid_number")):
+        return "شماره درست نیست. با کد کشور و کامل بفرست، مثل 09123456789."
+    if any(k in text for k in ("auth_from_another", "session_revoked",
+                               "authkeyunregistered", "userdeactivated",
+                               "invalid_auth", "invalidauth")):
+        return ("نشست این اکانت باطل شده — از دستگاه دیگری خارج شده یا پلتفرم "
+                "قطعش کرده. یک‌بار دیگر وارد شو.")
+    if any(k in text for k in ("too_requests", "toorequests", "too_many",
+                               "flood", "slowmode", "slow_mode",
+                               "many_requests")):
+        return ("پلتفرم موقتاً محدودیت گذاشته. کمی بعد دوباره امتحان کن — "
+                "چیزی خراب نشده.")
+    if "'busy': true" in text or "busy" in text and "held_for" in text:
+        return ("روی این اکانت همین حالا کار دیگری در جریان است. تا تمام شدنش "
+                "صبر کن و دوباره بزن.")
+    return _KIND_MSG.get(kind, _KIND_MSG["generic"])
+
+
 async def error(exc: BaseException = None, *, context: str = "",
                 customer=None, rows: list = None, notify: bool = True,
-                pv_extra: str = "") -> str:
+                pv_extra: str = "", kind: str = "generic") -> str:
     """Log a failure and return the error CODE to show the customer.
 
     The log group gets the exception type, the message and the traceback. The
@@ -202,14 +284,43 @@ async def error(exc: BaseException = None, *, context: str = "",
     await to_group(cards.card("⚠️ - #error", detail + [f"🕒 {now()}"]),
                    parse_mode="md")
     if notify and cid:
-        text = cards.card("⚠️ مشکلی پیش آمد", [
-            "درخواست شما کامل نشد.",
-            cards.kv("کد خطا", code, width=8),
-            (pv_extra or "این کد را برای پشتیبانی بفرست تا بررسی شود."),
-            f"🕒 {now()}",
-        ])
-        await to_pv(cid, text)
+        # Say WHAT went wrong, in a sentence the customer can act on. The error
+        # code stays for the ones nobody can act on — but a mistyped login code
+        # does not need a support ticket, and telling somebody to contact support
+        # about their own typo is how a working product feels broken.
+        explanation = humanize_error(exc, kind=kind) if exc is not None else ""
+        rows = [explanation or "درخواست شما کامل نشد."]
+        if not _self_inflicted(exc):
+            rows.append(cards.kv("کد خطا", code, width=8))
+            rows.append(pv_extra
+                        or "این کد را برای پشتیبانی بفرست تا بررسی شود.")
+        elif pv_extra:
+            rows.append(pv_extra)
+        rows.append(f"🕒 {now()}")
+        await to_pv(cid, cards.card("⚠️ انجام نشد", rows))
     return code
+
+
+# Failures the customer caused and can fix immediately. These get the explanation
+# WITHOUT an error code: a code invites a support ticket, and there is nothing for
+# support to do about a mistyped password.
+_SELF_INFLICTED = (
+    "codeisinvalid", "code_is_invalid", "invalid_code", "phone_code_invalid",
+    "phone_code_expired", "codeisexpired",
+    "password_hash_invalid", "passwordhashinvalid", "password_invalid",
+    "phone_number_invalid", "phonenumberinvalid", "invalid_number",
+    "not_registered", "notregistered",
+)
+
+
+def _self_inflicted(exc) -> bool:
+    if exc is None:
+        return False
+    try:
+        text = f"{type(exc).__name__} {exc!r}".lower()
+    except Exception:      # noqa: BLE001
+        return False
+    return any(k in text for k in _SELF_INFLICTED)
 
 
 # Anything whose NAME looks like a credential is redacted: this card goes to the

@@ -101,13 +101,29 @@ def _lock_for(key: str) -> asyncio.Lock:
     return lock
 
 
+# A login claim is not a job claim and must not share its lifetime.
+#
+# A send can legitimately hold a session for hours, which is what BUSY_STALE_SEC
+# is sized for. A login holds it only between "send me the code" and the code
+# arriving — and the code itself expires in about two minutes. When a customer
+# opened a login and walked away, the claim sat there for the full two hours and
+# every retry came back
+#   409 {'busy': True, 'what': 'login', 'held_for': 4035}
+# so the account was unusable for an hour after a single abandoned attempt.
+_SHORT_TTL = {"login": 300, "verify": 120}
+
+
+def _ttl_for(what: str) -> float:
+    return float(_SHORT_TTL.get(what) or config.BUSY_STALE_SEC)
+
+
 def _prune(key: str) -> None:
-    """Drop the entry if it has outlived BUSY_STALE_SEC (crashed holder)."""
+    """Drop the entry once it has outlived the TTL for its kind of work."""
     entry = _held.get(key)
     if not entry:
         return
     age = time.time() - float(entry.get("since") or 0)
-    if age > float(config.BUSY_STALE_SEC):
+    if age > _ttl_for(entry.get("what")):
         _held.pop(key, None)
 
 
@@ -132,11 +148,21 @@ def reason(key: str) -> str:
             f"{when}.\nبعد از اتمام دوباره امتحان کن.")
 
 
-def acquire(key: str, what: str, customer_id=None, extra: dict = None) -> bool:
-    """Claim the session. False when somebody else already holds it."""
+def acquire(key: str, what: str, customer_id=None, extra: dict = None,
+            takeover: bool = False) -> bool:
+    """Claim the session. False when somebody else already holds it.
+
+    `takeover` lets a claim replace an EXISTING claim of the SAME kind. It exists
+    for login: the key is (customer, phone), so the only thing that can collide
+    with a login is that same person's own earlier login attempt — and refusing
+    them because they pressed the button twice is absurd. A claim of a DIFFERENT
+    kind (a send in progress) is still a real conflict and is still refused.
+    """
     _prune(key)
     if key in _held:
-        return False
+        if not (takeover and _held[key].get("what") == what):
+            return False
+        _held.pop(key, None)
     _held[key] = {
         "what": what,
         "since": time.time(),

@@ -203,8 +203,126 @@ def start_card(customer_id) -> str:
 def start_menu() -> list:
     return [
         [Button.inline("🟣 Rubika", b"rb"), Button.inline("✈️ Telegram", b"tg")],
+        [Button.inline("🧰 ابزارها", b"tools")],
         [Button.inline("📖 راهنما", b"help"), Button.inline("🆘 پشتیبانی", b"support")],
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Tools — ported from the reference project's «🧰 ابزارها» section.
+#
+# Pure utilities that need no account and no platform connection, so they stay
+# usable when a session is broken or a subscription has lapsed.
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(data=b"tools"))
+async def tools_cb(event):
+    # need_active=False: a number list is useful to somebody deciding whether to
+    # renew, and there is no cost to us in generating one.
+    if not await _gate(event, need_active=False):
+        return
+    state.pop(event.sender_id, None)
+    await safe_edit(event, cards.card("🧰 ابزارها", [
+        "🔢 ساخت شماره ایران — بر اساس پیش‌شماره، لیست شماره می‌سازد و "
+        "اپراتور و استان آن را می‌گوید.",
+        cards.LINE,
+        f"سقف هر بار: {config.NUMGEN_MAX} شماره",
+    ]), buttons=[
+        [Button.inline("🔢 ساخت شماره ایران", b"tool_numgen")],
+        [Button.inline("🔙 منوی اصلی", b"home")],
+    ])
+
+
+@bot.on(events.CallbackQuery(data=b"tool_numgen"))
+async def tool_numgen_cb(event):
+    if not await _gate(event, need_active=False):
+        return
+    state[event.sender_id] = {"step": "await_numgen"}
+    await safe_edit(event, cards.card("🔢 ساخت شماره ایران", [
+        "پیش‌شماره و تعداد را در یک پیام بفرست:",
+        "`0913 500`",
+        cards.LINE,
+        "پیش‌شمارهٔ کامل‌تر هم می‌شود — `0913613 200` فقط رقم‌های باقی‌مانده را "
+        "پر می‌کند.",
+        f"حداکثر {config.NUMGEN_MAX} شماره در هر بار.",
+    ]), buttons=[[Button.inline("🔙 ابزارها", b"tools")]])
+
+
+async def _step_numgen(event, st):
+    import iran_numbers
+
+    uid = event.sender_id
+    state.pop(uid, None)
+    parts = (event.raw_text or "").split()
+    prefix = iran_numbers.clean_prefix(parts[0] if parts else "")
+    try:
+        count = int(parts[1]) if len(parts) > 1 else 100
+    except ValueError:
+        count = 0
+
+    if not prefix or not iran_numbers.is_valid_prefix(prefix):
+        await respond(event, cards.card("پیش‌شماره شناخته نشد", [
+            "یک پیش‌شمارهٔ موبایل ایران بفرست، مثل 0913 یا 0921.",
+            "مثال کامل: `0913 500`",
+        ]), buttons=[[Button.inline("🔙 ابزارها", b"tools")]])
+        return
+    if count < 1:
+        await respond(event, "تعداد را درست بفرست. مثال: `0913 500`",
+                      buttons=[[Button.inline("🔙 ابزارها", b"tools")]])
+        return
+    # Capped, and the cap is REPORTED rather than silently applied: a customer who
+    # asked for 50000 and got 5000 with no word would treat the file as complete.
+    asked = count
+    count = min(count, config.NUMGEN_MAX)
+
+    operator, region = iran_numbers.detect(prefix)
+    numbers = iran_numbers.gen_unique(prefix, count)
+    if not numbers:
+        await respond(event, "با این پیش‌شماره چیزی ساخته نشد.",
+                      buttons=[[Button.inline("🔙 ابزارها", b"tools")]])
+        return
+
+    # config has no DATA_DIR — backup.py defines its own from __file__, and that
+    # is the pattern here too. Writing to a name that does not exist would have
+    # raised AttributeError on the first customer who pressed the button.
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    os.makedirs(data_dir, exist_ok=True)
+    path = os.path.join(data_dir, f"numbers_{uid}_{prefix}.txt")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(numbers) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        await logbus.error(exc, context="numgen write", customer=uid)
+        return
+
+    rows = [
+        cards.kv("Prefix", prefix),
+        cards.kv("Operator", operator or "—"),
+        cards.kv("Region", region or "—"),
+        cards.kv("Count", cards.num(len(numbers))),
+    ]
+    if asked > count:
+        rows.append(f"⚠️ {cards.num(asked)} خواستی، سقف {cards.num(count)} است.")
+    # Fewer than asked can also happen legitimately: a long prefix leaves few
+    # remaining digits, so the search space itself is smaller than the request.
+    elif len(numbers) < count:
+        rows.append(f"⚠️ با این پیش‌شماره فقط {cards.num(len(numbers))} شمارهٔ "
+                    "یکتا امکان‌پذیر بود.")
+    rows.append("⚠️ این شماره‌ها تصادفی ساخته شده‌اند — یعنی وجود داشتنشان "
+                "تضمینی نیست. برای پیدا کردن شماره‌های واقعی از «افزودن مخاطب» "
+                "استفاده کن.")
+
+    try:
+        await _bot_send_file(uid, path, cards.card("🔢 شماره‌ها آماده شد", rows))
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+async def _bot_send_file(uid, path: str, caption: str) -> None:
+    await bot.send_file(int(uid), path, caption=caption,
+                        buttons=[[Button.inline("🔙 ابزارها", b"tools")]])
 
 
 @bot.on(events.NewMessage(pattern="/start", func=lambda e: e.is_private))
@@ -404,7 +522,8 @@ async def help_topic_cb(event):
 # --------------------------------------------------------------------------- #
 # Text router — the panels register their own steps here
 # --------------------------------------------------------------------------- #
-_STEPS: dict = {"await_ticket": _step_ticket}
+_STEPS: dict = {"await_ticket": _step_ticket,
+                "await_numgen": _step_numgen}
 
 
 def register_steps(steps: dict) -> None:

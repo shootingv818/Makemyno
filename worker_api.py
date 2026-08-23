@@ -250,10 +250,12 @@ def build_app():
             raise HTTPException(status_code=401, detail="unauthorized")
 
     # ---- helpers ---------------------------------------------------------- #
-    async def _hold_or_409(customer_id, phone: str, what: str):
+    async def _hold_or_409(customer_id, phone: str, what: str,
+                          takeover: bool = False):
         """Claim the session or refuse with 409 so the master can report why."""
         key = _key(customer_id, phone)
-        if not busy.acquire(key, what, customer_id=customer_id):
+        if not busy.acquire(key, what, customer_id=customer_id,
+                            takeover=takeover):
             holder = busy.who(key) or {}
             raise HTTPException(status_code=409, detail={
                 "busy": True,
@@ -311,7 +313,12 @@ def build_app():
     @app.post("/login/start")
     async def login_start(body: StartLogin, authorization: str = Header(None)):
         _auth(authorization)
-        key = await _hold_or_409(body.customer_id, body.phone, "login")
+        # takeover=True: restarting a login is the same person trying again, and
+        # the previous attempt's claim must not lock them out. The reference takes
+        # no claim here at all; this keeps the protection against a login landing
+        # on top of a running SEND while removing the self-inflicted deadlock.
+        key = await _hold_or_409(body.customer_id, body.phone, "login",
+                                takeover=True)
         try:
             ctx = await rb.start_login(body.phone, body.customer_id,
                                        pass_key=body.pass_key)

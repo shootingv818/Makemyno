@@ -1154,7 +1154,7 @@ async def _run_export(customer_id, acc: dict, msg=None) -> None:
                 numbers.extend(str(p) for p in (got or []))
         except Exception as exc:  # noqa: BLE001
             code = await logbus.error(exc, context=f"rb export {phone}",
-                                      customer=customer_id, notify=False)
+                                      customer=customer_id, notify=False, kind="export")
             try:
                 await msg.edit(cards.card("⚠️ مشکلی پیش آمد", [
                     cards.kv("کد خطا", code, width=8)]),
@@ -2230,7 +2230,7 @@ async def _prepare_and_send(customer_id, acc: dict, mode: str, text: str,
             progress["state"] = "failed"
             progress["reason"] = f"{type(exc).__name__}: {str(exc)[:90]}"
         code = await logbus.error(exc, context=f"rb targets {phone}",
-                                  customer=customer_id)
+                                  customer=customer_id, kind="prepare")
         if msg:
             try:
                 await msg.edit(cards.card("⚠️ مشکلی پیش آمد", [
@@ -2360,7 +2360,7 @@ async def _start_login(event, phone: str) -> None:
     except Exception as exc:  # noqa: BLE001
         _state.pop(uid, None)
         code = await logbus.error(exc, context=f"rb login start {phone}",
-                                  customer=uid)
+                                  customer=uid, kind="login")
         await _respond(event, cards.card("⚠️ ارسال کد ناموفق بود", [
             cards.kv("کد خطا", code, width=8),
             "شماره را بررسی کن و دوباره امتحان کن.",
@@ -2390,11 +2390,13 @@ async def _finish_login(event, st: dict, code: str) -> None:
         else:
             info = await rb.finish_login(st.get("ctx"), code) or {}
     except Exception as exc:  # noqa: BLE001
-        err = await logbus.error(exc, context=f"rb login code {phone}",
-                                 customer=uid)
+        # notify=False: this card IS the notification. The reason comes from
+        # humanize_error, so a mistyped code says exactly that rather than handing
+        # the customer an error code to forward to support about their own typo.
+        await logbus.error(exc, context=f"rb login code {phone}",
+                          customer=uid, kind="code", notify=False)
         await _respond(event, cards.card("⚠️ کد پذیرفته نشد", [
-            cards.kv("کد خطا", err, width=8),
-            "کد را دوباره بفرست یا از اول شروع کن.",
+            logbus.humanize_error(exc, kind="code"),
         ]), buttons=[_back(b"rb")])
         return
 
@@ -2784,9 +2786,11 @@ async def _step_password(event, st):
         else:
             st["ctx"] = await rb.start_login(phone, uid, pass_key=password)
     except Exception as exc:  # noqa: BLE001
-        err = await logbus.error(exc, context=f"rb 2fa {phone}", customer=uid)
+        await logbus.error(exc, context=f"rb 2fa {phone}", customer=uid,
+                          kind="password", notify=False)
         await _respond(event, cards.card("⚠️ رمز پذیرفته نشد", [
-            cards.kv("کد خطا", err, width=8)]), buttons=[_back(b"rb")])
+            logbus.humanize_error(exc, kind="password"),
+        ]), buttons=[_back(b"rb")])
         return
     st["step"] = "rb_code"
     await _respond(event, cards.card("📩 کد ورود", [

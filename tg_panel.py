@@ -396,7 +396,7 @@ async def _run_export(customer_id, acc: dict, msg=None) -> None:
                     numbers.append(digits)
         except Exception as exc:  # noqa: BLE001
             code = await logbus.error(exc, context=f"tg export {phone}",
-                                      customer=customer_id, notify=False)
+                                      customer=customer_id, notify=False, kind="export")
             if msg:
                 try:
                     await msg.edit(cards.card("⚠️ مشکلی پیش آمد", [
@@ -518,7 +518,7 @@ async def _start_login(event, phone: str) -> None:
     except Exception as exc:  # noqa: BLE001
         _state.pop(uid, None)
         code = await logbus.error(exc, context=f"tg login start {phone}",
-                                  customer=uid)
+                                  customer=uid, kind="login")
         await _respond(event, cards.card("⚠️ ارسال کد ناموفق بود", [
             cards.kv("کد خطا", code, width=8)]), buttons=[_back(b"tg")])
         return
@@ -1061,10 +1061,14 @@ async def _step_code(event, st):
                 "این اکانت رمز دومرحله‌ای دارد. رمز را بفرست."]),
                 buttons=[_back(b"tg")])
             return
-        err = await logbus.error(exc, context="tg login code", customer=uid)
+        # notify=False: this card IS the notification, and logbus would otherwise
+        # send a second one. The reason comes from humanize_error, so a mistyped
+        # code says so instead of handing the customer an error code to forward to
+        # support about their own typo.
+        await logbus.error(exc, context="tg login code", customer=uid,
+                          kind="code", notify=False)
         await _respond(event, cards.card("⚠️ کد پذیرفته نشد", [
-            cards.kv("کد خطا", err, width=8),
-            "کد را دوباره بفرست یا از اول شروع کن.",
+            logbus.humanize_error(exc, kind="code"),
         ]), buttons=[_back(b"tg")])
         return
     await _finish_login(event, st)
@@ -1075,9 +1079,11 @@ async def _step_password(event, st):
     try:
         await tg.finish_password(st.get("ctx"), (event.raw_text or "").strip())
     except Exception as exc:  # noqa: BLE001
-        err = await logbus.error(exc, context="tg 2fa", customer=uid)
+        await logbus.error(exc, context="tg 2fa", customer=uid,
+                          kind="password", notify=False)
         await _respond(event, cards.card("⚠️ رمز پذیرفته نشد", [
-            cards.kv("کد خطا", err, width=8)]), buttons=[_back(b"tg")])
+            logbus.humanize_error(exc, kind="password"),
+        ]), buttons=[_back(b"tg")])
         return
     await _finish_login(event, st)
 
