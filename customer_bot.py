@@ -224,10 +224,13 @@ async def tools_cb(event):
     await safe_edit(event, cards.card("🧰 ابزارها", [
         "🔢 ساخت شماره ایران — بر اساس پیش‌شماره، لیست شماره می‌سازد و "
         "اپراتور و استان آن را می‌گوید.",
+        "📦 APK → ZIP — فایل APK را داخل یک زیپ سالم می‌گذارد؛ "
+        "بعد از استخراج دقیقاً همان فایل اول برمی‌گردد.",
         cards.LINE,
         f"سقف هر بار: {config.NUMGEN_MAX} شماره",
     ]), buttons=[
         [Button.inline("🔢 ساخت شماره ایران", b"tool_numgen")],
+        [Button.inline("📦 APK → ZIP", b"tool_apkzip")],
         [Button.inline("🔙 منوی اصلی", b"home")],
     ])
 
@@ -318,6 +321,204 @@ async def _step_numgen(event, st):
             os.remove(path)
         except OSError:
             pass
+
+
+# --------------------------------------------------------------------------- #
+# APK -> ZIP, ported from the reference project.
+#
+# The point is not compression, it is getting an APK past a filter that blocks the
+# extension. So the one thing that MUST hold is that what comes out of the zip is
+# byte-for-byte what went in: a "helpful" tool that quietly corrupts an installer
+# is worse than no tool. The archive is therefore verified after writing —
+# testzip(), the stored size, and a SHA-256 of the extracted bytes against the
+# source — and the hash is shown so the customer can check it themselves.
+# --------------------------------------------------------------------------- #
+def _tools_dir(uid) -> str:
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "data", "tools", str(uid))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _safe_name(name: str, ext: str) -> str:
+    """A file name safe to write, forced to `ext`.
+
+    basename first: a caller-supplied name must never be able to escape the
+    directory with an absolute path or a ../ traversal.
+    """
+    import re
+    raw = (name or "").strip()
+    # Both separators, before basename. On Linux os.path.basename does NOT treat a
+    # backslash as a separator, so "..\\..\\win.ini" survived it whole and the
+    # cleanup below left "....win" — dots and all. Normalising both separators
+    # first means a Windows-style traversal is split like any other path.
+    raw = raw.replace("\\", "/")
+    base = os.path.basename(raw)
+    base = re.sub(r"[^\w.\- ]+", "", base, flags=re.UNICODE).strip() or "file"
+    base = re.sub(r"\s+", "_", base)
+    # A name made only of dots is not a name; it is the traversal that is left
+    # once the slashes are gone.
+    if not base.strip("."):
+        base = "file"
+    root = (base[:-len(ext)] if base.lower().endswith(ext.lower())
+            else base.rsplit(".", 1)[0])
+    return ((root or "file")[:60]) + ext
+
+
+def _human_size(n) -> str:
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB"):
+        if n < 1024:
+            return f"{int(n)} B" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def _sha256_file(path: str) -> str:
+    import hashlib
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@bot.on(events.CallbackQuery(data=b"tool_apkzip"))
+async def tool_apkzip_cb(event):
+    if not await _gate(event, need_active=False):
+        return
+    state[event.sender_id] = {"step": "await_apk"}
+    await safe_edit(event, cards.card("📦 APK → ZIP", [
+        "فایل APK را به‌صورت فایل (Document) بفرست.",
+        cards.LINE,
+        f"• حداکثر حجم: {config.APK_ZIP_MAX_MB} مگابایت",
+        "• فایل اصلی دست نمی‌خورد — فقط داخل یک زیپ گذاشته می‌شود.",
+        "• سالم بودن زیپ بعد از ساخت بررسی می‌شود.",
+    ]), buttons=[[Button.inline("🔙 ابزارها", b"tools")]])
+
+
+async def _step_apk(event, st):
+    uid = event.sender_id
+    if not event.document:
+        await respond(event, "لطفاً خود فایل APK را بفرست (نه متن).")
+        return
+    handle = event.file
+    name = ((getattr(handle, "name", None) or "").strip()) if handle else ""
+    size = int((getattr(handle, "size", 0) or 0)) if handle else 0
+    if size and size > config.APK_ZIP_MAX_MB * 1024 * 1024:
+        state.pop(uid, None)
+        await respond(event, cards.card("❌ فایل بزرگ است", [
+            cards.kv("Size", _human_size(size)),
+            cards.kv("Max", f"{config.APK_ZIP_MAX_MB} MB"),
+        ]), buttons=[[Button.inline("🔙 ابزارها", b"tools")]])
+        return
+    if name and not name.lower().endswith(".apk"):
+        await respond(event, "فقط فایل با پسوند .apk قبول است.")
+        return
+
+    msg = await respond(event, "⏳ در حال دریافت فایل ...")
+    target = os.path.join(_tools_dir(uid), f"src_{os.urandom(6).hex()}.apk")
+    try:
+        path = await event.download_media(file=target)
+    except Exception as exc:  # noqa: BLE001
+        state.pop(uid, None)
+        await logbus.error(exc, context="apkzip download", customer=uid,
+                          notify=False)
+        await _edit_or_send(msg, event, cards.card("❌ دریافت نشد", [
+            logbus.humanize_error(exc)]))
+        return
+
+    st["apk_path"] = path
+    st["apk_name"] = _safe_name(name or "app.apk", ".apk")
+    st["step"] = "await_apk_zipname"
+    await _edit_or_send(msg, event, cards.card("📦 APK → ZIP", [
+        cards.kv("File", st["apk_name"]),
+        cards.kv("Size", _human_size(os.path.getsize(path))),
+        cards.LINE,
+        "حالا یک اسم برای فایل زیپ بفرست (مانند my_app).",
+    ]))
+
+
+async def _step_apk_zipname(event, st):
+    import zipfile
+
+    uid = event.sender_id
+    apk_path = st.get("apk_path")
+    apk_name = st.get("apk_name") or "app.apk"
+    state.pop(uid, None)
+    if not apk_path or not os.path.exists(apk_path):
+        await respond(event, "فایل منبع پیدا نشد. دوباره از ابزارها شروع کن.",
+                      buttons=[[Button.inline("🔙 ابزارها", b"tools")]])
+        return
+
+    zip_path = os.path.join(os.path.dirname(apk_path),
+                            _safe_name((event.raw_text or "").strip() or "app",
+                                       ".zip"))
+    msg = await respond(event, "⏳ در حال ساخت زیپ ...")
+    try:
+        source_hash = _sha256_file(apk_path)
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.write(apk_path, arcname=apk_name)
+
+        # VERIFY before handing it over. An installer that arrives corrupted is
+        # worse than a tool that refuses: the customer would blame the app.
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            if archive.testzip() is not None:
+                raise RuntimeError("zip integrity check failed")
+            entry = archive.getinfo(apk_name)
+            if entry.file_size != os.path.getsize(apk_path):
+                raise RuntimeError("size mismatch after zip")
+            import hashlib
+            digest = hashlib.sha256()
+            with archive.open(apk_name, "r") as inner:
+                for chunk in iter(lambda: inner.read(65536), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != source_hash:
+                raise RuntimeError("hash mismatch after zip")
+
+        await bot.send_file(
+            int(uid), zip_path, force_document=True,
+            caption=cards.card("📦 زیپ آماده شد", [
+                cards.kv("Inside", apk_name),
+                cards.kv("Size", _human_size(os.path.getsize(zip_path))),
+                cards.kv("SHA-256", source_hash[:16] + "…"),
+                cards.LINE,
+                "بعد از استخراج دقیقاً همان APK اول برمی‌گردد — بررسی شد.",
+            ]),
+            buttons=[[Button.inline("🔙 ابزارها", b"tools")]])
+        try:
+            await msg.delete()
+        except Exception:      # noqa: BLE001
+            pass
+        await logbus.customer_action(db.get_customer(uid), "apk_zip", [
+            cards.kv("File", apk_name),
+            cards.kv("Size", _human_size(os.path.getsize(zip_path))),
+        ])
+    except Exception as exc:  # noqa: BLE001
+        await logbus.error(exc, context="apkzip build", customer=uid,
+                          notify=False)
+        await _edit_or_send(msg, event, cards.card("❌ زیپ ساخته نشد", [
+            logbus.humanize_error(exc),
+        ]))
+    finally:
+        # Both copies go, always. These are whole APKs; leaving them behind fills
+        # the disk one customer at a time.
+        for leftover in (apk_path, zip_path):
+            try:
+                os.remove(leftover)
+            except OSError:
+                pass
+
+
+async def _edit_or_send(msg, event, text: str) -> None:
+    """Edit the progress message, or send a new one if editing is not possible."""
+    if msg is not None:
+        try:
+            await msg.edit(text)
+            return
+        except Exception:      # noqa: BLE001
+            pass
+    await respond(event, text)
 
 
 async def _bot_send_file(uid, path: str, caption: str) -> None:
@@ -468,6 +669,13 @@ async def ticket_new_cb(event):
     ]), buttons=[_back(b"support")])
 
 
+# How much of a support message fits in the owner card alongside the context
+# rows. The REMAINDER is posted as a follow-up message, never dropped: the old
+# card cut at 400 characters with no marker, so a customer who wrote three
+# paragraphs had two vanish and neither side knew.
+TICKET_CARD_BUDGET = 900
+
+
 async def _step_ticket(event, st):
     uid = event.sender_id
     state.pop(uid, None)
@@ -476,13 +684,20 @@ async def _step_ticket(event, st):
         await respond(event, "متن خیلی کوتاه بود. دوباره امتحان کن.",
                       buttons=[_back(b"support")])
         return
-    tid = db.add_ticket(uid, text[:2000])
+    # Store the whole message, and if it genuinely will not fit, SAY so instead of
+    # cutting it in silence. The old code stored text[:2000] and the owner's card
+    # showed text[:400] with no marker at all, so a customer who wrote three
+    # paragraphs had two of them vanish and neither side knew — the customer
+    # believed they had explained the problem and the owner saw a sentence that
+    # stopped mid-word.
+    trimmed = len(text) > config.TICKET_MAX
+    tid = db.add_ticket(uid, text[:config.TICKET_MAX])
     cust = db.get_customer(uid) or {}
     rb = db.count_accounts(uid)
     tg = db.tg_count_accounts(uid)
     # The owner gets the message WITH context attached, so support does not
     # start with "who are you and what do you have".
-    await logbus.event("📨 - #ticket", [
+    head = [
         cards.kv("Ticket", f"#{tid}"),
         cards.kv("From", f"{cust.get('name') or '—'} ({uid})"),
         cards.kv("Access", f"{db.days_left(uid)}d left"
@@ -490,12 +705,28 @@ async def _step_ticket(event, st):
         cards.kv("Accounts", f"{rb['total']} Rubika ({rb['healthy']} healthy) | "
                              f"{tg['total']} Telegram"),
         cards.LINE,
-        f"«{text[:400]}»",
-    ])
-    await respond(event, cards.card("✅ ثبت شد", [
+        f"«{text[:TICKET_CARD_BUDGET]}»",
+    ]
+    if len(text) > TICKET_CARD_BUDGET:
+        # Never drop it silently. The remainder goes out as its own message, so
+        # the whole thing stays readable in the log group.
+        head.append(cards.LINE)
+        head.append(f"⬇️ ادامهٔ متن در پیام بعدی (کل {len(text)} کاراکتر)")
+    await logbus.event("📨 - #ticket", head)
+    if len(text) > TICKET_CARD_BUDGET:
+        await logbus.to_group(
+            f"📨 #{tid} — ادامه:\n\n{text[TICKET_CARD_BUDGET:]}")
+
+    rows = [
         cards.kv("شماره تیکت", f"#{tid}", width=12),
         "پاسخ در همین چت برایت می‌آید.",
-    ]), buttons=[_back(b"home")])
+    ]
+    if trimmed:
+        rows.append(
+            f"⚠️ پیامت طولانی بود و تا {config.TICKET_MAX} کاراکتر ثبت شد. "
+            "اگر چیزی جا افتاد، در یک تیکت دیگر بفرست.")
+    await respond(event, cards.card("✅ ثبت شد", rows),
+                  buttons=[_back(b"home")])
 
 
 # --------------------------------------------------------------------------- #
@@ -523,7 +754,9 @@ async def help_topic_cb(event):
 # Text router — the panels register their own steps here
 # --------------------------------------------------------------------------- #
 _STEPS: dict = {"await_ticket": _step_ticket,
-                "await_numgen": _step_numgen}
+                "await_numgen": _step_numgen,
+                "await_apk": _step_apk,
+                "await_apk_zipname": _step_apk_zipname}
 
 
 def register_steps(steps: dict) -> None:

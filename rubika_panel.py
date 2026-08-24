@@ -295,9 +295,9 @@ async def _run_send(customer_id, acc: dict, mode: str, text: str,
             cards.kv("Phone", phone),
             cards.kv("Mode", mode),
             cards.kv("Targets", len(targets)),
-            cards.kv("Content", (text or db.get_marker(customer_id))[:80]),
             cards.kv("Speed", f"{delay}s"),
-        ], platform="Rubika")
+        ] + [cards.LINE, "📝 Content:"] + cards.body(
+            text or f"«{db.get_marker(customer_id)}» (مارکر)"), platform="Rubika")
 
         w = worker.worker_for_account(acc)
         remote = bool(w and not worker.is_local(w))

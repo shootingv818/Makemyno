@@ -209,6 +209,16 @@ CONTACT_REMOTE_CHUNK = _int("CONTACT_REMOTE_CHUNK", 25)
 # Ceiling on one number-generation request. Generating is cheap, but a file of a
 # million lines is not something anyone can use and the upload alone would time
 # out — and the cap is reported to the customer rather than applied silently.
+# Longest support message we store. Sized to fit one Telegram message with the
+# context rows around it. Anything longer is reported to the customer rather
+# than cut in silence.
+TICKET_MAX = _int("TICKET_MAX", 3500)
+
+# Biggest APK we will accept for the zip tool. Telegram itself caps a bot
+# download well below this on most plans, but a ceiling here fails fast with
+# a clear message instead of after a long download.
+APK_ZIP_MAX_MB = _int("APK_ZIP_MAX_MB", 200)
+
 NUMGEN_MAX = _int("NUMGEN_MAX", 5000)
 
 FORCED_JOIN_CACHE_SEC = _int("FORCED_JOIN_CACHE_SEC", 300)

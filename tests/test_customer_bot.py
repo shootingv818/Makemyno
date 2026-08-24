@@ -299,10 +299,29 @@ def test_a_too_short_ticket_is_rejected(alice):
 
 
 def test_ticket_text_is_capped(alice):
+    """Capped, and the customer is TOLD when it happened.
+
+    The cap used to be a silent 2000, and the owner's card then showed only the
+    first 400 characters with no marker at all — so a customer who wrote three
+    paragraphs had two of them vanish and neither side knew. Both numbers moved,
+    but the point of the test is the notice, not the number.
+    """
     db.add_days(alice, 30)
-    event = _Ev(alice, "x" * 5000)
+    event = _Ev(alice, "x" * 9000)
     asyncio.run(customer_bot._step_ticket(event, {}))
-    assert len(db.customer_tickets(alice)[0]["text"]) <= 2000
+    stored = db.customer_tickets(alice)[0]["text"]
+    assert len(stored) <= config.TICKET_MAX
+    assert "کاراکتر" in event.said, \
+        "a trimmed message must say so; silence makes the customer think it arrived"
+
+
+def test_a_normal_ticket_is_stored_whole(alice):
+    db.add_days(alice, 30)
+    body = "مشکل " * 200          # ~1000 chars, well under the cap
+    event = _Ev(alice, body)
+    asyncio.run(customer_bot._step_ticket(event, {}))
+    assert db.customer_tickets(alice)[0]["text"] == body.strip()
+    assert "کاراکتر" not in event.said
 
 
 # --------------------------------------------------------------------------- #

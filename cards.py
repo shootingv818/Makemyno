@@ -65,6 +65,27 @@ def bar(done: int, total: int, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+def body(text, limit: int = 700) -> list:
+    """A multi-line value rendered as its OWN rows, not squeezed into a kv line.
+
+    The send card printed the customer's advert as kv("Content", text[:80]) and 80
+    characters lands in the middle of a sentence or, worse, in the middle of a URL —
+    so the owner saw "...خوشحال شی  https://t" and could not tell what was actually
+    being sent. A kv line is for one short value; a paragraph needs rows.
+
+    Long text is cut at `limit`, but the cut is ANNOUNCED with the real length, so
+    nobody mistakes a truncated preview for the whole message.
+    """
+    text = "" if text is None else str(text)
+    if not text.strip():
+        return ["—"]
+    shown = text[:limit]
+    rows = [line for line in shown.splitlines() if line.strip()]
+    if len(text) > limit:
+        rows.append(f"… (کل {len(text)} کاراکتر)")
+    return rows
+
+
 def num(value) -> str:
     """1234567 -> 1,234,567 (never raises)."""
     try:
