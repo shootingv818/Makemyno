@@ -16,6 +16,7 @@ names / response shapes can differ between versions; the helpers below are
 written defensively for that reason.
 """
 import asyncio
+import contextvars
 import inspect
 import os
 
@@ -111,18 +112,37 @@ _TRANSIENT_MARKERS = (
     "ERROR_GENERIC", "ERRORGENERIC",
 )
 
-# What the last retry loop did, for the card the owner reads. "It failed" is not
+# What the retry loop did, for the card the owner reads. "It failed" is not
 # actionable; "it failed three times on get_contacts" is.
-_LAST_TRANSIENT: dict = {"retries": 0, "where": "", "last": ""}
+#
+# PER-REQUEST, not module-global. A worker can prepare two different accounts at
+# the same time (the busy registry serialises one SESSION, not the process), and a
+# shared counter would have reported account A's retries on account B's card —
+# a wrong number on a diagnostic card is worse than no number, because it sends
+# the next investigation somewhere real work is not happening. A ContextVar is
+# copied per asyncio task, so each request gets its own dict; the dict is MUTATED
+# in place rather than reassigned, so nested tasks (asyncio.wait_for creates one)
+# still record into the request that owns them.
+_TRANSIENT_TRACE: contextvars.ContextVar = contextvars.ContextVar(
+    "rb_transient_trace", default=None)
+
+
+def _trace() -> dict:
+    trace = _TRANSIENT_TRACE.get()
+    if trace is None:
+        trace = {"retries": 0, "where": "", "last": ""}
+        _TRANSIENT_TRACE.set(trace)
+    return trace
 
 
 def last_transient() -> dict:
-    """Retry bookkeeping since the last reset. Read-only snapshot."""
-    return dict(_LAST_TRANSIENT)
+    """Retry bookkeeping for THIS request. Read-only snapshot."""
+    return dict(_trace())
 
 
 def reset_transient() -> None:
-    _LAST_TRANSIENT.update({"retries": 0, "where": "", "last": ""})
+    """Start a fresh trace for the current request."""
+    _TRANSIENT_TRACE.set({"retries": 0, "where": "", "last": ""})
 
 
 def is_transient_failure(err: Exception) -> bool:
@@ -181,16 +201,16 @@ async def retry_transient(fn, *args, tries: int = None, where: str = "",
         try:
             return await fn(*args, **kwargs)
         except Exception as exc:      # noqa: BLE001
+            trace = _trace()
             if not is_transient_failure(exc) or attempt >= tries - 1:
                 if is_transient_failure(exc):
                     # Exhausted, not swallowed: record it before it flies past.
-                    _LAST_TRANSIENT["where"] = label
-                    _LAST_TRANSIENT["last"] = \
-                        f"{type(exc).__name__}: {str(exc)[:160]}"
+                    trace["where"] = label
+                    trace["last"] = f"{type(exc).__name__}: {str(exc)[:160]}"
                 raise
-            _LAST_TRANSIENT["retries"] += 1
-            _LAST_TRANSIENT["where"] = label
-            _LAST_TRANSIENT["last"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+            trace["retries"] += 1
+            trace["where"] = label
+            trace["last"] = f"{type(exc).__name__}: {str(exc)[:160]}"
             delay = base * (2 ** attempt)
             if jitter:
                 import random

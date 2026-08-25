@@ -65,9 +65,15 @@ def no_waiting(monkeypatch):
     monkeypatch that simply skipped sleeping could not tell the two apart.
     """
     slept = []
+    real_sleep = asyncio.sleep
 
     async def _sleep(seconds):
         slept.append(seconds)
+        # Still YIELD to the event loop. A patch that just returns makes every
+        # coroutine run to completion without interleaving, so a concurrency test
+        # would pass against code that shares state between accounts — which is
+        # exactly the bug it is supposed to catch.
+        await real_sleep(0)
 
     monkeypatch.setattr(asyncio, "sleep", _sleep)
     monkeypatch.setattr(config, "RB_RETRY_BASE", 2.0)
@@ -157,6 +163,65 @@ def test_an_invalid_auth_is_never_retried():
     with pytest.raises(RuntimeError):
         asyncio.run(rb.get_contacts_full(client))
     assert client.calls == 1, "an auth failure must be raised on the first try"
+
+
+def test_a_dead_session_disguised_as_a_generic_error_is_not_retried():
+    """The dangerous overlap, and the reason auth is checked FIRST.
+
+    A revoked session does not always answer INVALID_AUTH alone. rubpy's shape for
+    it is {'status': 'ERROR_GENERIC', 'status_det': 'INVALID_AUTH'} — a body that
+    carries a transient-LOOKING status and the auth verdict at the same time. If
+    the transient markers were consulted first, every page of a dead account would
+    be retried three times, which is precisely the hammering that gets an account
+    revoked for good.
+    """
+    err = ServerError(status="ERROR_GENERIC", det="INVALID_AUTH")
+    assert not rb.is_transient_failure(err), \
+        "auth must win over a transient-looking status in the same response"
+
+    class _Dead:
+        def __init__(self):
+            self.calls = 0
+
+        async def get_contacts(self, start_id=None):
+            self.calls += 1
+            raise ServerError(status="ERROR_GENERIC", det="INVALID_AUTH")
+
+    client = _Dead()
+    with pytest.raises(ServerError):
+        asyncio.run(rb.get_contacts_full(client))
+    assert client.calls == 1, "a revoked session must be reported, not retried"
+
+
+def test_two_accounts_preparing_at_once_do_not_share_a_retry_counter():
+    """A worker serialises one SESSION, not the whole process.
+
+    Two different accounts can prepare concurrently, and with a module-global
+    counter account A's retries appeared on account B's card. A wrong number on a
+    diagnostic card is worse than none: it points the next investigation at a
+    place where nothing is wrong.
+    """
+    # Ordered so the interleaving is deterministic and the bug is unavoidable:
+    # the NOISY account fails on its very first page, so it has already recorded
+    # retries by the time the quiet account — which has more pages and therefore
+    # finishes later — reads its own trace. With one shared counter the quiet
+    # account reports the other account's retries.
+    async def _one(pages, fail_on):
+        rb.reset_transient()
+        await rb.get_contacts_full(_Contacts(pages, fail_on=fail_on))
+        return rb.last_transient()
+
+    async def _both():
+        return await asyncio.gather(
+            _one([["g1"], ["g2"], ["g3"], ["g4"]], None),      # quiet, longer
+            _one([["h1"], ["h2"]], {1: 2}),                    # noisy, early
+        )
+
+    quiet, noisy = asyncio.run(_both())
+    assert quiet["retries"] == 0, \
+        "an account that never hiccuped must not inherit another's retries"
+    assert quiet["where"] == "", "nor another account's failing call"
+    assert noisy["retries"] == 2, "the account that did hiccup must still report"
 
 
 def test_retries_can_be_switched_off_from_the_env(monkeypatch):
