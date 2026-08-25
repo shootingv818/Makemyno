@@ -2226,16 +2226,27 @@ async def _prepare_and_send(customer_id, acc: dict, mode: str, text: str,
     try:
         targets = await _collect_targets(customer_id, acc, mode)
     except Exception as exc:  # noqa: BLE001
+        # A transient platform answer gets its Persian sentence on the card. The
+        # customer was being shown a raw Python dict —
+        # "ServerError: {'status': 'ERROR_TRY_AGAIN', ...}" — for a condition that
+        # means nothing more than "ask again in a moment". The technical reason is
+        # NOT dropped: logbus.error still records type, message and traceback
+        # under the error code below.
+        transient = rb.is_transient_failure(exc)
         if progress is not None:
             progress["state"] = "failed"
-            progress["reason"] = f"{type(exc).__name__}: {str(exc)[:90]}"
+            progress["reason"] = (
+                "سرور روبیکا موقتاً پاسخ نداد؛ چند دقیقه بعد دوباره بزن"
+                if transient else f"{type(exc).__name__}: {str(exc)[:90]}")
         code = await logbus.error(exc, context=f"rb targets {phone}",
                                   customer=customer_id, kind="prepare")
         if msg:
             try:
-                await msg.edit(cards.card("⚠️ مشکلی پیش آمد", [
-                    cards.kv("کد خطا", code, width=8)]),
-                    buttons=[_back(b"rbaccs")])
+                rows = [logbus.humanize_error(exc, kind="prepare")] if transient \
+                    else []
+                rows.append(cards.kv("کد خطا", code, width=8))
+                await msg.edit(cards.card("⚠️ مشکلی پیش آمد", rows),
+                               buttons=[_back(b"rbaccs")])
             except Exception:
                 pass
         return
@@ -2295,12 +2306,17 @@ async def _collect_targets(customer_id, acc: dict, mode: str = "marker") -> list
         async def _prep_op():
             return await worker.api_call(w, "POST", "/prepare", {
                 "customer_id": customer_id, "phone": phone, "mode": mode,
-                "marker": db.get_marker(customer_id)}, timeout=240)
+                "marker": db.get_marker(customer_id)},
+                timeout=config.PREPARE_CALL_TIMEOUT)
 
         # A worker with no session file for this account reads ZERO contacts
         # rather than failing, so the repair path matters here as much as it does
         # for channels: it is the same missing session, one symptom later.
-        prep = await session_store.run_with_repair(customer_id, acc, _prep_op)
+        #
+        # run_resilient, not run_with_repair: a Rubika ERROR_TRY_AGAIN is not a
+        # session problem and used to abort the account's whole campaign on the
+        # first hiccup, before a single message went out.
+        prep = await session_store.run_resilient(customer_id, acc, _prep_op)
         return _guids_only(prep.get("targets"))
 
     import account_conn
@@ -2313,9 +2329,10 @@ async def _collect_targets(customer_id, acc: dict, mode: str = "marker") -> list
             return await rb.get_ordered_recipients(client)
 
         async def _work_op():
-            return await account_conn.call(customer_id, phone, _work, timeout=300)
+            return await account_conn.call(customer_id, phone, _work,
+                                           timeout=config.PREPARE_TIMEOUT)
 
-        got = await session_store.run_with_repair(customer_id, acc, _work_op)
+        got = await session_store.run_resilient(customer_id, acc, _work_op)
         # Defensive: a tuple here is the shape that produced "Targets: 2" and two
         # failed sends on an account with hundreds of contacts. The contract is a
         # list now, and anything else is coerced rather than silently messaged.

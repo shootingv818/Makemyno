@@ -45,19 +45,28 @@ class _FakeTg:
 
     def __init__(self):
         self.uploads = []
+        self.upload_names = []
         self.copies = []
         self.texts = []
         self.direct_media = []
+        self.direct_names = []
 
-    async def upload_to_saved(self, client, path, caption=""):
+    # The fakes RECORD file_name rather than accepting and dropping it: the name
+    # the recipient sees is decided at upload time, and a fake that swallowed the
+    # argument is exactly why the campaign shipped "<uid>_<random>_name.pdf" to
+    # every contact without a single test noticing.
+    async def upload_to_saved(self, client, path, caption="", file_name=""):
         self.uploads.append(path)
+        self.upload_names.append(file_name)
         return _SavedMsg(path)
 
     async def send_saved_media(self, client, entity, saved, caption=""):
         self.copies.append((entity, saved.media))
 
-    async def send_media(self, client, entity, path, caption="", typing=0.0):
+    async def send_media(self, client, entity, path, caption="", typing=0.0,
+                         file_name=""):
         self.direct_media.append((entity, path))
+        self.direct_names.append(file_name)
 
     async def send_text(self, client, entity, text, typing=0.0):
         self.texts.append((entity, text))

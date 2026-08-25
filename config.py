@@ -169,6 +169,47 @@ SEND_TIMEOUT = _int("SEND_TIMEOUT", 60)
 # Post a progress card every this-many successful sends.
 SEND_LOG_EVERY = _int("SEND_LOG_EVERY", 50)
 
+# --------------------------------------------------------------------------- #
+# Transient platform failures (ERROR_TRY_AGAIN / SERVER_ERROR)
+# --------------------------------------------------------------------------- #
+# Rubika answers a request it cannot serve right now with a 200 whose body says
+# {'status': 'ERROR_TRY_AGAIN', 'status_det': 'SERVER_ERROR'}. rubpy treats that
+# as fatal on the generic method path (methods/advanced/build.py raises straight
+# away) even though its OWN upload loop reinitialises and retries on exactly the
+# same status (network.py, "Server requested reinitialization"). So /prepare died
+# on a hiccup that the library itself considers retryable, and a whole account's
+# campaign reported failure before one message went out.
+#
+# Every knob below can be set to 0 in .env to restore the previous behaviour
+# exactly — no redeploy, no code change.
+RB_RETRY_TRIES = _int("RB_RETRY_TRIES", 3)          # 1 = no retry (old behaviour)
+RB_RETRY_BASE = _float("RB_RETRY_BASE", 2.0)        # 2s, then 4s
+RB_RETRY_JITTER = _float("RB_RETRY_JITTER", 0.5)    # +0..0.5s, so parallel
+                                                    # accounts do not resync
+
+# Pause between PAGES of a paginated read. /prepare fired up to ~400 requests
+# (200 contact pages + 200 chat pages) back to back with no gap at all, on a
+# freshly opened connection: that burst is what earns ERROR_TRY_AGAIN in the
+# first place, and no amount of retrying prevents it. 0 restores the old burst.
+RB_PAGE_DELAY = _float("RB_PAGE_DELAY", 0.4)
+
+# The whole prepare step, worker side and master side. These MUST be larger than
+# before: page delays plus retry backoff on an account with thousands of contacts
+# can otherwise cross the old 180s/240s caps, which would swap ServerError for a
+# TimeoutError and look like a brand-new bug.
+PREPARE_TIMEOUT = _int("PREPARE_TIMEOUT", 300)          # inside the worker
+PREPARE_CALL_TIMEOUT = _int("PREPARE_CALL_TIMEOUT", 420)  # master -> worker HTTP
+
+# --------------------------------------------------------------------------- #
+# File names
+# --------------------------------------------------------------------------- #
+# Keep the name the customer's file actually had, on both platforms. Telethon
+# derives a document's name from os.path.basename() of the path it is handed
+# (telethon/utils.py get_attributes), so a stored path like
+# "<uid>_<random>_report.pdf" was delivered to recipients under that literal
+# name. Set to 0 to go back to the old naming if anything ever looks wrong.
+KEEP_FILE_NAME = _bool("KEEP_FILE_NAME", True)
+
 # ---- auto-resume after an error burst ----
 RESUME_WAIT = _int("RESUME_WAIT", 300)
 RESUME_MAX_RETRIES = _int("RESUME_MAX_RETRIES", 2)

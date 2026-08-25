@@ -125,3 +125,43 @@ async def run_with_repair(customer_id, acc: dict, operation):
             raise
         # The stored session is now on the right server. One more attempt.
         return await operation()
+
+
+async def run_resilient(customer_id, acc: dict, operation):
+    """run_with_repair, plus ONE settled retry when the PLATFORM said "try again".
+
+    Two different failures, two different cures, deliberately not merged into one
+    handler:
+
+      * auth-shaped  -> the session is in the wrong place. place() and retry.
+                        That is run_with_repair, unchanged.
+      * transient    -> Rubika answered ERROR_TRY_AGAIN / SERVER_ERROR. Nothing is
+                        wrong with the session and re-placing it would be pointless
+                        work on a healthy account; the cure is to wait and ask again.
+
+    The wait is SESSION_SETTLE_SEC and it is NOT optional. A remote prepare runs on
+    a fresh connection, so retrying immediately would close and reopen the same
+    session within milliseconds — the exact churn that Rubika answers with
+    INVALID_AUTH. Retrying without settling would turn a transient hiccup into a
+    quarantined account, which is strictly worse than the bug being fixed.
+
+    Set RB_RETRY_TRIES=1 to make this behave exactly like run_with_repair.
+    """
+    try:
+        return await run_with_repair(customer_id, acc, operation)
+    except Exception as first:      # noqa: BLE001
+        # Text-based on purpose: for a remote account this failure arrives as a
+        # WorkerAPIError carrying the worker's detail string, not as the original
+        # rubpy exception, so type checks would never match across the HTTP hop.
+        if not rb.is_transient_failure(first):
+            raise
+        tries, _base, _jitter = rb._retry_settings()
+        if tries <= 1:
+            raise
+        import asyncio
+
+        import config
+        settle = float(getattr(config, "SESSION_SETTLE_SEC", 0) or 0)
+        if settle > 0:
+            await asyncio.sleep(settle)
+        return await run_with_repair(customer_id, acc, operation)

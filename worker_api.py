@@ -437,6 +437,9 @@ def build_app():
     async def prepare(body: Prepare, authorization: str = Header(None)):
         _auth(authorization)
         key = await _hold_or_409(body.customer_id, body.phone, "send")
+        # Declared BEFORE the try: the error handler reads it, so it must exist
+        # even if the very first line inside the try is what failed.
+        stage = {"at": "start"}
         try:
             import account_conn
 
@@ -450,28 +453,54 @@ def build_app():
             # account with hundreds of them. The marker is now advisory: text
             # mode never looks for it, and marker mode reports whether it was
             # found without hiding the recipient list.
+            # WHICH of the three reads failed is the one fact this endpoint never
+            # reported. A bare "ServerError: {'status': 'ERROR_TRY_AGAIN'}" left
+            # us unable to tell a getMe hiccup on a just-opened connection from a
+            # throttled contact page halfway through a big account — and those
+            # need different answers. The stage travels with the error now.
+            stage["at"] = "connect"
+
             async def _work(client):
+                stage["at"] = "get_self_guid"
                 self_guid = await rb.get_self_guid(client)
-                message_id = None if text_mode else \
-                    await rb.find_marked_message(client, body.marker)
+                if not text_mode:
+                    stage["at"] = "find_marked_message"
+                    message_id = await rb.find_marked_message(client, body.marker)
+                else:
+                    message_id = None
+                stage["at"] = "get_ordered_recipients"
                 recipients = await rb.get_ordered_recipients(client)
+                stage["at"] = "done"
                 return self_guid, message_id, recipients
 
+            rb.reset_transient()
             self_guid, message_id, recipients = await account_conn.fresh_call(
-                body.customer_id, body.phone, _work, timeout=180)
+                body.customer_id, body.phone, _work,
+                timeout=config.PREPARE_TIMEOUT)
             # Plain guid strings over the wire. get_ordered_recipients yields
             # {"guid", "name"} dicts, and shipping those made the master str() a
             # dict into every send target.
             targets = [str(r.get("guid") if isinstance(r, dict) else r)
                        for r in (recipients or [])
                        if (r.get("guid") if isinstance(r, dict) else r)]
+            trace = rb.last_transient()
             return {"ok": True, "from_guid": self_guid,
                     "message_id": message_id,
                     "marker_found": bool(message_id) or text_mode,
-                    "targets": targets}
+                    "targets": targets,
+                    # Retries that SUCCEEDED are invisible otherwise, and a run
+                    # that needed six of them is a warning worth seeing on the
+                    # card before it becomes an outage.
+                    "retries": int(trace.get("retries") or 0),
+                    "retried_at": trace.get("where") or ""}
         except Exception as exc:
-            raise HTTPException(status_code=400,
-                                detail=f"{type(exc).__name__}: {str(exc)[:200]}")
+            trace = rb.last_transient()
+            detail = f"{type(exc).__name__}: {str(exc)[:200]}"
+            detail += f" [stage={stage['at']}"
+            if trace.get("retries"):
+                detail += f", retries={trace['retries']} on {trace.get('where')}"
+            detail += "]"
+            raise HTTPException(status_code=400, detail=detail)
         finally:
             _release(key, "send")
             await _settle()
@@ -561,12 +590,22 @@ def build_app():
         if not raw:
             return {"ok": False, "error": "empty file payload"}
 
-        up_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "data", "uploads")
+        # A directory per request, with the file keeping its OWN name inside it.
+        #
+        # Two reasons, both real. (1) The name is what the recipient sees: rubpy
+        # falls back to os.path.basename() of the path when no file_name is given,
+        # so the path must not carry a prefix or a stripped-down name. (2) The old
+        # layout wrote every upload to data/uploads/<name>, so two customers
+        # sending "list.pdf" at the same moment used ONE file, and the first
+        # request's `finally: os.remove(path)` deleted the second one mid-upload.
+        # Uniqueness belongs in the directory, never in the file name.
+        up_root = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "data", "uploads")
+        up_dir = os.path.join(up_root, uuid.uuid4().hex[:12])
         os.makedirs(up_dir, exist_ok=True)
-        # basename only: never let a caller-supplied name escape up_dir with an
-        # absolute path or a ../ traversal.
-        fname = os.path.basename(body.file_name or "") or "file.bin"
+        # safe_file_name strips path separators and traversal, so a caller-supplied
+        # name can never escape up_dir — while spaces and Persian text survive.
+        fname = rb.safe_file_name(body.file_name or "", fallback="file.bin")
         path = os.path.join(up_dir, fname)
         try:
             with open(path, "wb") as fh:
@@ -591,15 +630,25 @@ def build_app():
             saved_guid, mid, targets = await account_conn.fresh_call(
                 body.customer_id, body.phone, _work, timeout=300)
             return {"ok": True, "from_guid": saved_guid, "message_id": mid,
-                    "targets": targets, "total": len(targets)}
+                    "targets": targets, "total": len(targets),
+                    # Echo the name that was actually used, so the master can put
+                    # it on the card and the customer can see it is their own.
+                    "file_name": fname}
         except Exception as exc:      # noqa: BLE001 - report, never 500
             return {"ok": False,
                     "error": f"upload failed: {type(exc).__name__}: {str(exc)[:160]}"}
         finally:
             _release(key, "upload")
             await _settle()
+            # Remove the request's own directory, not a shared file: with one
+            # directory per request this can no longer delete another customer's
+            # upload while it is still being sent.
             try:
                 os.remove(path)
+            except OSError:
+                pass
+            try:
+                os.rmdir(up_dir)
             except OSError:
                 pass
 

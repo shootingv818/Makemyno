@@ -39,21 +39,31 @@ def _src(name):
 
 
 def _function_body(body: str, header: str) -> str:
-    """One whole top-level function, from its `def` to the next top-level one.
+    """One whole function, from its `def` to wherever its indentation ends.
 
     A fixed byte window was used here before, and it silently stopped covering
     the function as soon as the code grew — reporting a missing normalisation
     that was in fact three lines below the cut. The window now ends where the
     function does.
+
+    Indentation-aware rather than "up to the next top-level def", because the
+    worker's endpoints are NESTED inside build_app(): a top-level marker never
+    appears between two of them, so such a slice would silently run to the end of
+    the module and the assertions would stop proving anything about one endpoint.
     """
     start = body.index(header)
-    rest = body[start + len(header):]
-    end = len(rest)
-    for marker in ("\nasync def ", "\ndef ", "\nclass "):
-        at = rest.find(marker)
-        if at != -1:
-            end = min(end, at)
-    return header + rest[:end]
+    lines = body[start:].splitlines()
+    indent = len(lines[0]) - len(lines[0].lstrip())
+    end = len(lines)
+    for i, line in enumerate(lines[1:], start=1):
+        if not line.strip():
+            continue
+        current = len(line) - len(line.lstrip())
+        if current <= indent and not line.lstrip().startswith(("#", ")", "]", "}",
+                                                              "@")):
+            end = i
+            break
+    return "\n".join(lines[:end])
 
 
 def _code(name):
@@ -197,8 +207,10 @@ def test_send_targets_are_normalised_to_strings():
 
 
 def test_the_worker_ships_guid_strings_not_dicts():
+    # Sliced to the end of the endpoint, never a byte window: this assertion
+    # started failing the moment /prepare grew a few explanatory lines, which is
+    # the failure mode the window was warned about in _function_body.
     body = _src("worker_api.py")
-    start = body.index('@app.post("/prepare")')
-    section = body[start:start + 2500]
+    section = _function_body(body, "    async def prepare(")
     assert '"targets": targets' in section
     assert 'r.get("guid")' in section, "dicts must be flattened before the wire"

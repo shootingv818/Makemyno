@@ -1109,15 +1109,38 @@ async def _step_add_media(event, st):
 
     The real filename matters: a document that arrives as 'file_0.bin' looks
     broken to the recipient.
+
+    THE NAME IS THE FILE'S OWN, AND THE DIRECTORY CARRIES THE UNIQUENESS.
+    This used to build "<uid>_<random>_<name>" and strip the name down to
+    `isalnum() or ._-`, which deleted every space and bracket. Telethon then took
+    the recipient-visible filename from os.path.basename() of that path
+    (telethon/utils.py get_attributes), so a customer's
+    "لیست قیمت (نهایی) 1404.xlsx" was delivered as
+    "7658493021_9f3c1a44_لیستقیمت1404.xlsx". Uniqueness in a per-upload directory
+    keeps the name untouched, which is exactly what the reference project does
+    (customer_bot.download_media(file=store_dir)).
     """
     uid = event.sender_id
     if event.file is None:
         await _respond(event, "فایلی پیدا نشد. عکس یا فایل بفرست.")
         return
     _state.pop(uid, None)
-    name = getattr(event.file, "name", None) or f"file_{os.urandom(3).hex()}"
-    safe = "".join(ch for ch in name if ch.isalnum() or ch in "._-") or "file"
-    path = os.path.join(MEDIA_DIR, f"{uid}_{os.urandom(4).hex()}_{safe}")
+    # One definition of "what is a safe file name" for the whole project, imported
+    # here rather than re-implemented: the two platforms disagreeing about it is
+    # how Telegram ended up stripping spaces that Rubika kept.
+    import rubika_client as rb
+
+    raw_name = getattr(event.file, "name", None) or ""
+    safe = rb.safe_file_name(raw_name, fallback=f"file_{os.urandom(3).hex()}")
+    if config.KEEP_FILE_NAME:
+        store_dir = os.path.join(MEDIA_DIR, "content", str(uid),
+                                 os.urandom(4).hex())
+        os.makedirs(store_dir, exist_ok=True)
+        path = os.path.join(store_dir, safe)
+    else:
+        # The old layout, kept reachable with KEEP_FILE_NAME=0 so a bad surprise
+        # in production can be undone from .env without a redeploy.
+        path = os.path.join(MEDIA_DIR, f"{uid}_{os.urandom(4).hex()}_{safe}")
     try:
         await event.download_media(path)
     except Exception as exc:  # noqa: BLE001

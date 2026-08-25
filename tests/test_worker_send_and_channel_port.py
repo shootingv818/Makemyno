@@ -344,8 +344,35 @@ def test_upload_prepare_endpoint_never_raises_on_a_bad_payload():
     src = _func_src("worker_api.py", "upload_prepare", code_only=True)
     assert '"ok": False' in src, \
         "/upload/prepare must report a clean error so the master can fall back"
-    assert "basename" in src, \
+    # The guarantee is "a caller-supplied name cannot escape the upload
+    # directory", not "the word basename appears". basename alone was also the
+    # reason two customers uploading list.pdf shared one file — and the first
+    # request's cleanup deleted the second one mid-send.
+    assert "safe_file_name" in src, \
         "a caller-supplied file name could escape the upload directory"
+    assert "uuid" in src, \
+        "uniqueness must come from the directory so the file keeps its own name"
+
+
+def test_a_supplied_file_name_cannot_escape_the_upload_directory():
+    """The behaviour behind the assertion above, not just its spelling."""
+    for attack in ("../../etc/passwd", "/etc/passwd", "..\\..\\windows\\x.dll",
+                   "a/b/c.txt"):
+        cleaned = rb.safe_file_name(attack, fallback="file.bin")
+        assert "/" not in cleaned and "\\" not in cleaned, cleaned
+        assert not cleaned.startswith(".."), cleaned
+        joined = os.path.join("/data/uploads/abc123", cleaned)
+        assert os.path.normpath(joined).startswith("/data/uploads/abc123/"), \
+            f"{attack!r} escaped to {joined}"
+
+
+def test_the_upload_keeps_the_customers_own_file_name():
+    """Spaces, brackets and Persian text must survive — that name is what the
+    recipient sees, because rubpy falls back to the path's basename."""
+    for name in ("لیست قیمت (نهایی) 1404.xlsx", "My Report v2.pdf",
+                 "قرارداد نهایی.docx"):
+        assert rb.safe_file_name(name) == name, \
+            "the customer's own file name was altered"
 
 
 def test_newest_saved_message_id_returns_int_or_none(monkeypatch):

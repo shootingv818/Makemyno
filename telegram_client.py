@@ -315,29 +315,90 @@ async def send_text(client: TelegramClient, entity, text: str, typing: float = 0
     return await safe_call(lambda: client.send_message(entity, text))
 
 
+def _name_attributes(file_path: str, file_name: str = ""):
+    """[DocumentAttributeFilename] for the name the RECIPIENT should see, or None.
+
+    Telethon derives a document's name from os.path.basename() of whatever path it
+    is handed (telethon/utils.py, get_attributes). Our stored path is
+    "<uid>_<random>_<name>", so every file arrived at the recipient carrying that
+    prefix — the customer's "قرارداد نهایی.pdf" was delivered as
+    "7658493021_9f3c1a44_قراردادنهایی.pdf". Passing the attribute explicitly
+    overrides the guess, and it also means a future change to the storage layout
+    can never leak into what the recipient sees.
+
+    Returns None when there is nothing to override with, so the caller falls back
+    to Telethon's own behaviour rather than sending a nameless document.
+    """
+    import os
+
+    import rubika_client as rb      # safe_file_name lives there; one definition
+
+    if not rb._keep_file_name():
+        return None
+    name = rb.safe_file_name(file_name or "", fallback="") \
+        or rb.safe_file_name(os.path.basename(file_path or ""), fallback="")
+    if not name:
+        return None
+    try:
+        from telethon.tl.types import DocumentAttributeFilename
+        return [DocumentAttributeFilename(file_name=name)]
+    except Exception:      # noqa: BLE001 - never fail a send over a nicer name
+        return None
+
+
+async def _send_file_named(client: TelegramClient, entity, file, caption: str,
+                           file_path: str = "", file_name: str = ""):
+    """send_file with an explicit filename, falling back to the plain call.
+
+    A photo sent as a photo has no filename at all on Telegram's side, and some
+    builds reject `attributes` for non-document media. Losing the name is a
+    cosmetic problem; failing the send is a campaign problem — so any failure here
+    retries exactly the call this code made before.
+    """
+    attributes = _name_attributes(file_path or (file if isinstance(file, str)
+                                                else ""), file_name)
+    if attributes:
+        try:
+            return await safe_call(lambda: client.send_file(
+                entity, file, caption=caption or None, attributes=attributes))
+        except (TypeError, ValueError):
+            pass
+    return await safe_call(
+        lambda: client.send_file(entity, file, caption=caption or None))
+
+
 async def send_media(client: TelegramClient, entity, file_path: str,
-                     caption: str = "", typing: float = 0.0):
+                     caption: str = "", typing: float = 0.0,
+                     file_name: str = ""):
     if typing > 0:
         await _typing(client, entity, typing)
-    return await safe_call(
-        lambda: client.send_file(entity, file_path, caption=caption or None))
+    return await _send_file_named(client, entity, file_path, caption,
+                                  file_path=file_path, file_name=file_name)
 
 
 async def send_content(client: TelegramClient, entity, text: str = "",
-                       file_path: str = "", caption: str = "", typing: float = 0.0):
+                       file_path: str = "", caption: str = "", typing: float = 0.0,
+                       file_name: str = ""):
     """Send configured content: a media file with caption if file_path is set,
     otherwise a plain text message."""
     if file_path:
-        return await send_media(client, entity, file_path, caption or text, typing)
+        return await send_media(client, entity, file_path, caption or text, typing,
+                                file_name=file_name)
     return await send_text(client, entity, text, typing)
 
 
-async def upload_to_saved(client: TelegramClient, file_path: str, caption: str = ""):
+async def upload_to_saved(client: TelegramClient, file_path: str,
+                          caption: str = "", file_name: str = ""):
     """Upload a media file ONCE to the account's own Saved Messages and return
     the resulting Message. The file is then FORWARDED to every recipient, so it
-    is uploaded a single time instead of re-uploaded per chat (much faster)."""
-    return await safe_call(
-        lambda: client.send_file("me", file_path, caption=caption or None))
+    is uploaded a single time instead of re-uploaded per chat (much faster).
+
+    This is THE place the recipient-visible name is decided for a whole campaign:
+    every later send reuses this upload's media object, so the name recorded here
+    is the name a thousand recipients get.
+    """
+    return await _send_file_named(client, "me", file_path, caption,
+                                  file_path=file_path, file_name=file_name)
 
 
 async def forward_to(client: TelegramClient, entity, message):

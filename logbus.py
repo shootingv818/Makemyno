@@ -234,6 +234,15 @@ def humanize_error(err, kind: str = "generic") -> str:
                                "many_requests")):
         return ("پلتفرم موقتاً محدودیت گذاشته. کمی بعد دوباره امتحان کن — "
                 "چیزی خراب نشده.")
+    # AFTER the auth checks on purpose: an INVALID_AUTH must keep its own
+    # sentence. ERROR_TRY_AGAIN / SERVER_ERROR is Rubika saying "not right now" —
+    # the session is fine and the account is fine. The customer was being shown
+    # the raw response dict for this, which reads like a crash and generated
+    # support tickets for a condition that clears itself.
+    if any(k in text for k in ("error_try_again", "errortryagain",
+                               "server_error", "servererror")):
+        return ("سرور روبیکا موقتاً جواب نداد و چند بار تلاش دوباره هم نتیجه "
+                "نداد. اکانت و نشست سالم‌اند — چند دقیقه بعد دوباره بزن.")
     if "'busy': true" in text or "busy" in text and "held_for" in text:
         return ("روی این اکانت همین حالا کار دیگری در جریان است. تا تمام شدنش "
                 "صبر کن و دوباره بزن.")

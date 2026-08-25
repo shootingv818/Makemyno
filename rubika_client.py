@@ -91,6 +91,179 @@ class SessionNotSignable(RuntimeError):
     """
 
 
+# --------------------------------------------------------------------------- #
+# Transient platform failures
+# --------------------------------------------------------------------------- #
+# Rubika answers a request it cannot serve right now with HTTP 200 and a body of
+# {'status': 'ERROR_TRY_AGAIN', 'status_det': 'SERVER_ERROR'}. rubpy's generic
+# method path (methods/advanced/build.py) raises ServerError for that immediately
+# — while rubpy's OWN upload loop (network.py) reinitialises and RESTARTS on the
+# very same status, logging "Server requested reinitialization". Its request()
+# retry only covers transport errors, so a 200-with-error-status never gets one.
+#
+# Nothing in this project or in the reference handled it, so a single hiccup on
+# any page of getContacts/getChats aborted the whole prepare step and an account
+# with hundreds of recipients was reported failed before one message went out.
+_TRANSIENT_MARKERS = (
+    "ERROR_TRY_AGAIN", "ERRORTRYAGAIN",
+    "SERVER_ERROR", "SERVERERROR",
+    "TOO_REQUESTS", "TOOREQUESTS",
+    "ERROR_GENERIC", "ERRORGENERIC",
+)
+
+# What the last retry loop did, for the card the owner reads. "It failed" is not
+# actionable; "it failed three times on get_contacts" is.
+_LAST_TRANSIENT: dict = {"retries": 0, "where": "", "last": ""}
+
+
+def last_transient() -> dict:
+    """Retry bookkeeping since the last reset. Read-only snapshot."""
+    return dict(_LAST_TRANSIENT)
+
+
+def reset_transient() -> None:
+    _LAST_TRANSIENT.update({"retries": 0, "where": "", "last": ""})
+
+
+def is_transient_failure(err: Exception) -> bool:
+    """Is this the platform saying "not now, ask again"?
+
+    Auth is checked FIRST and always wins. Retrying an INVALID_AUTH would be the
+    worst thing we could do: repeated calls on a session the platform has already
+    rejected is the exact pattern that gets an account revoked, and the caller
+    upstream needs to see the auth failure to run its repair path.
+    """
+    if is_auth_failure(err):
+        return False
+    text = str(err).upper()
+    if any(marker in text for marker in _TRANSIENT_MARKERS):
+        return True
+    # A timeout on a read is the same class of problem: nothing was written, and
+    # asking again is safe. Kept narrow — only real timeout types, not anything
+    # whose message happens to mention the word.
+    return isinstance(err, (asyncio.TimeoutError, TimeoutError))
+
+
+def _retry_settings() -> tuple:
+    """(tries, base, jitter) from config, tolerating a missing config module.
+
+    Read at CALL time rather than import time so a test — or the owner editing
+    .env and restarting — changes behaviour without touching this file.
+    """
+    try:
+        import config
+        tries = max(1, int(getattr(config, "RB_RETRY_TRIES", 3) or 1))
+        base = float(getattr(config, "RB_RETRY_BASE", 2.0) or 0)
+        jitter = float(getattr(config, "RB_RETRY_JITTER", 0.5) or 0)
+    except Exception:      # noqa: BLE001 - config is never optional in practice
+        tries, base, jitter = 3, 2.0, 0.5
+    return tries, base, jitter
+
+
+async def retry_transient(fn, *args, tries: int = None, where: str = "",
+                          **kwargs):
+    """Call ``fn`` and retry ONLY a transient platform answer.
+
+    Deliberately not a general-purpose retry:
+      * an auth failure is never retried (see is_transient_failure),
+      * the LAST failure is re-raised with its original type and message, so the
+        real reason still reaches the error card instead of being replaced by a
+        generic "gave up",
+      * only ever wrapped around READ-ONLY calls. A send must not be retried
+        blindly — the recipient would get the message twice.
+
+    With RB_RETRY_TRIES=1 this is exactly the old behaviour: one attempt, raise.
+    """
+    tries_cfg, base, jitter = _retry_settings()
+    tries = tries or tries_cfg
+    label = where or getattr(fn, "__name__", "call")
+    for attempt in range(tries):
+        try:
+            return await fn(*args, **kwargs)
+        except Exception as exc:      # noqa: BLE001
+            if not is_transient_failure(exc) or attempt >= tries - 1:
+                if is_transient_failure(exc):
+                    # Exhausted, not swallowed: record it before it flies past.
+                    _LAST_TRANSIENT["where"] = label
+                    _LAST_TRANSIENT["last"] = \
+                        f"{type(exc).__name__}: {str(exc)[:160]}"
+                raise
+            _LAST_TRANSIENT["retries"] += 1
+            _LAST_TRANSIENT["where"] = label
+            _LAST_TRANSIENT["last"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+            delay = base * (2 ** attempt)
+            if jitter:
+                import random
+                delay += random.uniform(0, jitter)
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+
+# --------------------------------------------------------------------------- #
+# File names
+# --------------------------------------------------------------------------- #
+# Characters that would break a path or that a filesystem refuses. NOTHING else
+# is removed — the previous filter kept only `isalnum() or ._-`, which deleted
+# spaces and brackets, so "لیست قیمت (نهایی) 1404.xlsx" reached the recipient as
+# "لیستقیمت(نهایی)1404.xlsx" minus its brackets too. A customer who sends a file
+# expects the file's own name back.
+_UNSAFE_NAME_CHARS = set('/\\:*?"<>|\r\n\t\0')
+
+
+def _keep_file_name() -> bool:
+    """Owner kill-switch: KEEP_FILE_NAME=0 restores the old naming everywhere."""
+    try:
+        import config
+        return bool(getattr(config, "KEEP_FILE_NAME", True))
+    except Exception:      # noqa: BLE001
+        return True
+
+
+def safe_file_name(name: str, fallback: str = "file") -> str:
+    """The customer's own file name, minus only what a path cannot contain.
+
+    Never returns a path, and keeps spaces, Persian letters, brackets and
+    parentheses intact.
+
+    `fallback` is returned when nothing usable is left, and passing fallback=""
+    deliberately yields "" — a caller that only wants to OVERRIDE a name when it
+    has a real one needs to be able to tell "nothing" from "call it file".
+    """
+    raw = (name or "").replace("\\", "/")
+    raw = raw.rsplit("/", 1)[-1].strip()
+    cleaned = "".join(ch for ch in raw
+                      if ch not in _UNSAFE_NAME_CHARS and ch.isprintable())
+    cleaned = cleaned.strip(". ").strip()
+    if not cleaned:
+        return fallback
+    # Long names are trimmed from the MIDDLE of the stem so the extension — the
+    # part that decides whether the recipient can open the file at all — survives.
+    if len(cleaned) > 120:
+        stem, dot, ext = cleaned.rpartition(".")
+        if dot and len(ext) <= 12:
+            cleaned = stem[:120 - len(ext) - 1] + "." + ext
+        else:
+            cleaned = cleaned[:120]
+    return cleaned
+
+
+async def page_pause() -> None:
+    """Wait between pages of a paginated read.
+
+    The burst is the cause, the retry is only the cure. /prepare fired up to ~400
+    paginated requests with no gap on a freshly opened connection, and the more
+    contacts an account had the more reliably Rubika answered ERROR_TRY_AGAIN.
+    RB_PAGE_DELAY=0 restores that burst exactly.
+    """
+    try:
+        import config
+        delay = float(getattr(config, "RB_PAGE_DELAY", 0.0) or 0)
+    except Exception:      # noqa: BLE001
+        delay = 0.0
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+
 def normalize_phone(phone: str) -> str:
     """Rubika expects digits with country code, no '+' and no leading 0.
     '+989121234567' -> '989121234567', '09121234567' -> '989121234567'
@@ -556,8 +729,10 @@ async def get_contact_phones(client: Client, should_stop=None,
     for _ in range(200):          # safety cap: 200 * ~100 = 20k contacts
         if should_stop is not None and should_stop():
             break
-        result = await client.get_contacts(start_id) if start_id \
-            else await client.get_contacts()
+        result = await retry_transient(client.get_contacts, start_id,
+                                       where="get_contacts") if start_id \
+            else await retry_transient(client.get_contacts,
+                                       where="get_contacts")
         users = getattr(result, "users", None)
         if users is None and isinstance(result, dict):
             users = result.get("users", [])
@@ -574,16 +749,25 @@ async def get_contact_phones(client: Client, should_stop=None,
         start_id = _next_start_id(result)
         if not start_id or not users:
             break
+        await page_pause()
     return out
 
 
 async def get_contacts_full(client: Client) -> list:
-    """Return ALL contacts as dicts {guid, name, last_online, online}, paginated."""
+    """Return ALL contacts as dicts {guid, name, last_online, online}, paginated.
+
+    Every page goes through retry_transient: this loop is where the campaign died.
+    One ERROR_TRY_AGAIN on page 7 of an account's contacts used to abort the whole
+    prepare step, and the customer was told the account had failed.
+    """
     out = []
     seen = set()
     start_id = None
     for _ in range(200):  # safety cap (200 * ~100 = 20k)
-        result = await client.get_contacts(start_id) if start_id else await client.get_contacts()
+        result = await retry_transient(client.get_contacts, start_id,
+                                       where="get_contacts") if start_id \
+            else await retry_transient(client.get_contacts,
+                                       where="get_contacts")
         users = getattr(result, "users", None)
         if users is None and isinstance(result, dict):
             users = result.get("users", [])
@@ -600,12 +784,16 @@ async def get_contacts_full(client: Client) -> list:
         start_id = _next_start_id(result)
         if not start_id or not users:
             break
+        await page_pause()
     return out
 
 
 async def get_chats_user_guids(client: Client):
     """Return an ORDERED list of guids of USER chats (most recent activity first)
     and the total number of groups the account is in.
+
+    Same retry and same pause as the contact pages: this runs immediately after
+    them on the same connection, so it is the second half of the burst.
     """
     user_chats = []
     seen_u = set()
@@ -613,7 +801,9 @@ async def get_chats_user_guids(client: Client):
     seen_g = set()
     start_id = None
     for _ in range(200):
-        result = await client.get_chats(start_id) if start_id else await client.get_chats()
+        result = await retry_transient(client.get_chats, start_id,
+                                      where="get_chats") if start_id \
+            else await retry_transient(client.get_chats, where="get_chats")
         chats = getattr(result, "chats", None)
         if chats is None and isinstance(result, dict):
             chats = result.get("chats", [])
@@ -631,6 +821,7 @@ async def get_chats_user_guids(client: Client):
         start_id = _next_start_id(result)
         if not start_id or not chats:
             break
+        await page_pause()
     return user_chats, n_groups
 
 
@@ -734,7 +925,12 @@ def _msg_text_of(msg):
 
 
 async def get_self_guid(client: Client) -> str:
-    me = await client.get_me()
+    """The account's own guid.
+
+    Retried, because this is the FIRST call made on a just-opened connection and
+    a server-side hiccup here failed prepare before it had read anything at all.
+    """
+    me = await retry_transient(client.get_me, where="get_me")
     guid = _guid_of(me)
     if not guid:
         raise RuntimeError("could not resolve self guid")
@@ -774,7 +970,13 @@ async def find_marked_message(client: Client, marker: str):
             # the newest 20 messages were ever examined, and any account whose
             # marked post sat further back reported "marker not found" while the
             # marker was plainly there.
-            result = await client.get_messages(saved_guid, str(max_id), "20")
+            #
+            # Retried too. This except-branch does not fail the search, it ENDS
+            # it — so a one-off ERROR_TRY_AGAIN on page 3 silently reported
+            # "marker not found" for a marker that was sitting on page 4.
+            result = await retry_transient(client.get_messages, saved_guid,
+                                           str(max_id), "20",
+                                           where="get_messages")
         except Exception as exc:      # noqa: BLE001
             # An AUTH failure must NOT be swallowed. A bare `except: break` here
             # once hid a dead session for hours: reading Saved returned None as
@@ -802,6 +1004,7 @@ async def find_marked_message(client: Client, marker: str):
             break
         seen_ids.add(str(next_id))
         max_id = next_id
+        await page_pause()
     _LAST_MARKER_SCAN.update({"scanned": scanned, "marker": marker,
                               "error": last_error})
     return None
@@ -1860,11 +2063,43 @@ async def upload_file_to_self(client: Client, file_path: str, caption: str = "",
     have_file = any(k.lower() in ("document", "file", "path", "file_path",
                                   "media", "doc") for k in kwargs)
 
+    # THE NAME THE RECIPIENT SEES. The signature-inspection above can never place
+    # file_name, because rubpy's send_document is declared
+    #   (object_guid, document, caption, reply_to_message_id, auto_delete,
+    #    *args, **kwargs)
+    # with no file_name parameter at all — so `name` was computed, never passed,
+    # and silently discarded. It only ever looked right by accident, because the
+    # worker happens to write the upload to a path whose basename is the real name.
+    #
+    # rubpy does honour it as a keyword: send_document forwards **kwargs into
+    # send_message, which fills kwargs['file_name'] (defaulting to the path's
+    # basename) and network.py puts that value into the file_inline the recipient
+    # sees. So pass it explicitly instead of hoping the path is right.
+    if name and _keep_file_name() and not any(
+            ("file_name" in key.lower() or key.lower() in ("name", "filename"))
+            for key in kwargs):
+        kwargs["file_name"] = name
+
     upload_timeout = 60
+
+    async def _attempt(with_name: bool):
+        if have_guid and have_file:
+            call_kwargs = dict(kwargs)
+            if not with_name:
+                call_kwargs.pop("file_name", None)
+            return await fn(**call_kwargs)
+        if with_name and name and _keep_file_name():
+            return await fn(saved_guid, file_path, caption=text, file_name=name)
+        return await fn(saved_guid, file_path, caption=text)
+
     try:
-        coro = fn(**kwargs) if (have_guid and have_file) \
-            else fn(saved_guid, file_path, caption=text)
-        res = await asyncio.wait_for(coro, timeout=upload_timeout)
+        try:
+            res = await asyncio.wait_for(_attempt(True), timeout=upload_timeout)
+        except TypeError:
+            # A rubpy build that refuses the extra keyword. Losing the original
+            # name is bad; failing the whole upload over it is worse, so fall back
+            # to exactly the call this function made before.
+            res = await asyncio.wait_for(_attempt(False), timeout=upload_timeout)
     except asyncio.TimeoutError:
         raise RuntimeError(f"upload timed out after {upload_timeout}s")
 

@@ -805,14 +805,19 @@ async def prepare_content(client, content: list) -> list:
         kind = (item or {}).get("kind") or "text"
         text = (item or {}).get("text") or ""
         path = (item or {}).get("file_path") or ""
+        # The name the customer's own file had. It was stored in tg_content from
+        # the day media was added and then never read by anything that sends, so
+        # every recipient saw the storage path's basename instead.
+        name = (item or {}).get("file_name") or ""
         if kind == "media" and path:
             saved = None
             try:
-                saved = await tg.upload_to_saved(client, path, text)
+                saved = await tg.upload_to_saved(client, path, text,
+                                                 file_name=name)
             except Exception:      # noqa: BLE001 - fall back to per-send upload
                 saved = None
             plan.append({"kind": "media", "saved": saved, "path": path,
-                         "text": text})
+                         "text": text, "file_name": name})
         else:
             plan.append({"kind": "text", "text": text})
     return plan
@@ -843,7 +848,8 @@ async def _deliver(client, target: dict, content: list, delay: float,
                                           step.get("text") or "")
             elif step["kind"] == "media":
                 await tg.send_media(client, entity, step["path"],
-                                    caption=step.get("text") or "")
+                                    caption=step.get("text") or "",
+                                    file_name=step.get("file_name") or "")
             else:
                 await tg.send_text(client, entity, step.get("text") or "",
                                    typing=typing)
@@ -861,7 +867,8 @@ async def _deliver(client, target: dict, content: list, delay: float,
         path = (item or {}).get("file_path") or ""
         started = time.monotonic()
         if kind == "media" and path:
-            await tg.send_media(client, entity, path, caption=text)
+            await tg.send_media(client, entity, path, caption=text,
+                                file_name=(item or {}).get("file_name") or "")
         else:
             await tg.send_text(client, entity, text, typing=typing)
         # Measure what the PLATFORM costs us, separately from our own delay.
