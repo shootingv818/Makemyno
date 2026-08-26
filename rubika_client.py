@@ -858,31 +858,44 @@ async def get_ordered_recipients(client: Client) -> list:
     bugs. The contact count now comes from finish_login, which already has a live
     client.
 
-    Order requested by the user:
-      1) contacts we already have a chat with (most recent first)
-      2) then contacts that are currently online
-      3) then the rest, by last-seen (most recent first)
+    ORDER, exactly as the reference project orders it:
+      1) contacts who are ONLINE RIGHT NOW — within that tier the ones we already
+         have a chat with come first (by recent activity), then the rest of the
+         online ones by most-recent last-seen
+      2) then contacts we have a chat with but who are offline (recent first)
+      3) then everyone else by LAST SEEN, most recent visit first
 
-    Returns (ordered: list of {guid, name}, stats: dict).
+    This repo had drifted into a different order — chat-first, online second —
+    which buries the people most likely to read the message right now behind an
+    old conversation list. Online first is the whole point: a message that arrives
+    while someone is in the app is read, and a read message is the one that does
+    not get reported.
     """
     contacts = await get_contacts_full(client)
     user_chats, n_groups = await get_chats_user_guids(client)
 
     by_guid = {c["guid"]: c for c in contacts if c["guid"]}
 
-    # 1) contacts with a chat, in recent-activity order
-    with_chat = [g for g in user_chats if g in by_guid]
-    with_chat_set = set(with_chat)
+    online_set = {g for g in by_guid if by_guid[g]["online"]}
 
-    rest = [g for g in by_guid if g not in with_chat_set]
-    # 2) online first, 3) then by last_online desc
-    rest.sort(key=lambda g: (1 if by_guid[g]["online"] else 0, by_guid[g]["last_online"]),
-              reverse=True)
+    # recent-activity order of the chats we have (drives tiers 1 and 2)
+    chat_order = [g for g in user_chats if g in by_guid]
+    chat_rank = {g: i for i, g in enumerate(chat_order)}
 
-    ordered_guids = with_chat + rest
-    ordered = [{"guid": g, "name": by_guid[g]["name"]} for g in ordered_guids]
+    def _last(guid):
+        return by_guid[guid]["last_online"] or 0
 
-    return ordered
+    # 1) ONLINE now
+    tier1 = sorted(online_set,
+                   key=lambda g: (chat_rank.get(g, len(chat_rank)), -_last(g)))
+    # 2) offline, but we have a chat with them
+    tier2 = [g for g in chat_order if g not in online_set]
+    # 3) everyone else, most recently seen first
+    placed = online_set | set(tier2)
+    tier3 = sorted((g for g in by_guid if g not in placed), key=lambda g: -_last(g))
+
+    ordered_guids = tier1 + tier2 + tier3
+    return [{"guid": g, "name": by_guid[g]["name"]} for g in ordered_guids]
 
 
 # --------------------------------------------------------------------------- #

@@ -48,10 +48,11 @@ _live: dict = {}
 # Injected so a running job can refresh the customer's live card.
 _bot = None
 
-# A FloodWait no longer than this is simply waited out in place: parking the
-# account and reopening its session later costs more than the wait itself.
-# Anything longer parks the account so the rest of the job carries on without it.
-FLOOD_INLINE_MAX = 90
+# Kept as the module-level name the tests and older callers use, but it now comes
+# from config so the owner can change it without a code change. The DEFAULT is 0,
+# which is the reference behaviour: park on EVERY FloodWait. See the comment at
+# the park site for why an inline sleep was the wrong default.
+FLOOD_INLINE_MAX = config.TG_FLOOD_INLINE_MAX
 
 # How many times one account may be throttled before the job gives up on it.
 # Retrying a rate-limited account indefinitely only deepens the limit, and its
@@ -139,18 +140,66 @@ def _is_flood(exc: BaseException) -> int:
 
 
 def _is_fatal_account_error(exc: BaseException) -> bool:
-    """Errors that mean this ACCOUNT is finished, not this recipient.
+    """Errors that mean this ACCOUNT cannot work AT ALL right now.
 
-    Distinguishing the two is the difference between skipping one contact and
-    hammering a dead account for hours.
+    Distinguishing this from a per-recipient error is the difference between
+    skipping one contact and hammering a dead account for hours.
+
+    Two groups, and the second one is ported from the reference:
+      * the session is gone (auth revoked, account deactivated or banned), and
+      * the CONNECTION is gone (network down, socket closed, a send that hung
+        long enough to time out).
+
+    Ours only had the first group, so a worker that lost its network spent five
+    recipients' worth of failures on the consecutive-error ceiling before giving
+    up — and recorded the account as if IT were the problem.
     """
     name = type(exc).__name__
     text = str(exc).upper()
-    return (name in ("AuthKeyUnregisteredError", "UserDeactivatedError",
-                     "UserDeactivatedBanError", "SessionRevokedError",
-                     "AuthKeyDuplicatedError", "PhoneNumberBannedError")
+    if (name in ("AuthKeyUnregisteredError", "UserDeactivatedError",
+                 "UserDeactivatedBanError", "SessionRevokedError",
+                 "AuthKeyDuplicatedError", "PhoneNumberBannedError")
             or "AUTH_KEY" in text or "USER_DEACTIVATED" in text
-            or "SESSION_REVOKED" in text)
+            or "SESSION_REVOKED" in text):
+        return True
+    # Checked BEFORE the connection family below, not because sqlite3.Error is
+    # part of it today, but because "database is locked" is our own contention and
+    # must never be able to read as a dead account. Ordering says so explicitly
+    # instead of relying on today's exception hierarchy.
+    return _is_connection_error(exc)
+
+
+def _is_restriction_error(exc: BaseException) -> bool:
+    """An account-wide SEND RESTRICTION — the platform limiting this account.
+
+    Ported from the reference, where this is the ONLY class of error that counts
+    toward the consecutive-error ceiling. Ours counted every transient error, so
+    five scattered network hiccups spread over a thousand recipients stopped an
+    account that was in perfect health, and the customer was told it had been
+    "kept aside for its own safety" for no reason at all.
+
+    A PeerFlood is different in kind: it is Telegram saying "this account is
+    messaging strangers too much". Five of those in a row genuinely means stop.
+    """
+    text = f"{type(exc).__name__}:{exc}".upper()
+    return any(token in text for token in
+               ("PEERFLOOD", "PEER_FLOOD", "TOO MANY REQUESTS",
+                "TOOMANYREQUESTS"))
+
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    """A momentary SQLite contention error ("database is locked" / "busy").
+
+    From the reference. This is not the account's fault and must never burn it:
+    the job pauses and resumes from its durable checkpoint. Ours had no such
+    class, so a locked database either counted toward the account's error ceiling
+    or — when raised between recipients — failed the WHOLE JOB.
+    """
+    import sqlite3
+    if not isinstance(exc, sqlite3.Error):
+        return False
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
 
 
 def _is_permanent_recipient_error(exc: BaseException) -> bool:
@@ -351,14 +400,19 @@ async def _run(customer_id, job_id) -> None:
     control = _controls.setdefault(job_id, {"stop": False})
     try:
         # Any recipient still marked inflight belongs to a turn that was killed
-        # (restart, crash, forced stop). Nobody owns it, so without this it is
-        # never attempted again and the job can never reach 100%.
-        recovered = db.tgm_reset_inflight(customer_id, job_id)
-        if recovered:
+        # (restart, crash, forced cancel). Nobody owns it and NOBODY KNOWS whether
+        # the message arrived, so it is quarantined as 'uncertain' rather than
+        # retried — retrying is how the same person gets the advert twice, which is
+        # what gets an account reported. The card counts uncertain toward the
+        # total, so the job still completes.
+        uncertain = db.tgm_reset_inflight(customer_id, job_id)
+        if uncertain:
             await logbus.customer_action(
                 db.get_customer(customer_id), "tg_multi_recovered", [
                     cards.kv("Job", job_id),
-                    cards.kv("Requeued", cards.num(recovered)),
+                    cards.kv("Uncertain", cards.num(uncertain)),
+                    "این تعداد وسط ارسال قطع شدند و معلوم نیست پیام رسیده یا "
+                    "نه — دوباره فرستاده نمی‌شوند تا کسی دو بار پیام نگیرد.",
                 ], platform="Telegram")
 
         # Accounts are walked in rounds, not once. A single pass could never
@@ -380,7 +434,9 @@ async def _run(customer_id, job_id) -> None:
                     continue
                 await _run_account(customer_id, job_id, account, control)
                 worked = True
-            if control["stop"] or db.are_sends_frozen():
+                if control.get("pause"):
+                    break
+            if control["stop"] or db.are_sends_frozen() or control.get("pause"):
                 break
             if worked:
                 continue                    # another pass: parked ones may be due
@@ -415,7 +471,19 @@ async def _run(customer_id, job_id) -> None:
                     pass
             if not await _sleep_unless_stopped(control, wait + 2):
                 break
-            db.tgm_wake_cooled(customer_id, job_id)
+            woken = db.tgm_wake_cooled(customer_id, job_id)
+            # ANTI-SPIN GUARD, from the reference — adapted to our loop shape.
+            #
+            # The reference sleeps a parked cooldown in 30-second chunks, so it
+            # can legitimately come round again without waking anything and only
+            # gives up when the remaining wait is already zero. We sleep the WHOLE
+            # cooldown plus two seconds, so by this line every cooldown that was
+            # going to expire has expired: if nothing woke up, asking again gets
+            # the same answer for ever. That is a hot loop hammering sqlite
+            # thousands of times a second while the job innocently reads
+            # "waiting" — so stop instead, leaving the pending work for a resume.
+            if not woken:
+                break
             db.tgm_update_job(customer_id, job_id, state="running")
 
         counts = db.tgm_counts(customer_id, job_id)
@@ -482,6 +550,17 @@ _TURN_END_FA = {
                     "دوباره امتحان کنی."),
     "stopped": ("⏹ متوقف شد",
                 "ارسال این اکانت به‌درخواست شما یا توسط مدیر متوقف شد."),
+    # A lost connection says nothing about the account, and telling the customer
+    # their account is broken for a network blip sends them to re-login a healthy
+    # account — which costs an SMS code and puts the session on another server.
+    "connection": ("📡 ارتباط قطع شد",
+                   "ارتباط با تلگرام در میانهٔ کار قطع شد. اکانت سالم است و "
+                   "نیازی به ورود مجدد ندارد؛ نوبت به اکانت بعدی رفت و با "
+                   "«ادامه» این اکانت از همان‌جا ادامه می‌دهد."),
+    "db_busy": ("⏸ یک لحظه شلوغ شد",
+                "دیتابیس همان لحظه مشغول بود، پس ارسال نیمه‌کاره نگه داشته شد "
+                "تا چیزی دو بار فرستاده نشود. هیچ مخاطبی از دست نرفت — با "
+                "«ادامه» از همان نقطه ادامه می‌یابد."),
 }
 
 
@@ -538,6 +617,42 @@ async def _tell_customer_turn_ended(customer_id, job_id, phone: str,
         await _bot.send_message(int(customer_id), text)
     except Exception:      # noqa: BLE001 - a notice is never worth failing a send
         pass
+
+
+def _stop_wanted(control: dict, customer_id=None, job_id=None) -> bool:
+    """Has anything asked this job to stop?
+
+    THREE sources, and the DB one is ported from the reference. Ours consulted
+    only the in-memory `_controls` flag, so a stop was invisible to any process
+    that did not own the task — after a restart, or from the owner panel running
+    in the other service, the button reported success while the job carried on
+    sending. The reference polls tg_multi_jobs.stop_requested for exactly that
+    reason.
+    """
+    if control.get("stop"):
+        return True
+    if db.are_sends_frozen():
+        return True
+    if customer_id is None or job_id is None:
+        return False
+    try:
+        job = db.tgm_get_job(customer_id, job_id)
+    except Exception:      # noqa: BLE001 - a read failure must not stop a send
+        return False
+    if job and int(job.get("stop_requested") or 0):
+        control["stop"] = True      # remember it, so later checks are free
+        return True
+    return False
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    """A lost connection or a hung send — the account itself is not implicated."""
+    if _is_transient_db_error(exc):
+        return False
+    lowered = type(exc).__name__.lower()
+    return (isinstance(exc, (ConnectionError, TimeoutError, OSError))
+            or any(token in lowered
+                   for token in ("connection", "network", "disconnect")))
 
 
 async def _sleep_unless_stopped(control: dict, seconds: float,
@@ -607,13 +722,19 @@ async def _run_account(customer_id, job_id, account: dict, control: dict) -> Non
             ], platform="Telegram")
 
         sent = failed = skipped = 0
-        consecutive = 0
+        # Resume the DURABLE counter, as the reference does. It lived only in this
+        # local variable, so an account parked on a FloodWait after four
+        # restriction errors came back with a clean slate and could keep
+        # collecting restrictions for ever without reaching the ceiling.
+        # tgm_requeue_stopped_accounts clears it when the customer resumes, which
+        # is the one place a fresh start is intended.
+        consecutive = int(account.get("consec_fail") or 0)
         max_errors = db.get_max_errors(customer_id)
         stop_reason = ""
         flood_seconds = 0
 
         while True:
-            if control["stop"] or db.are_sends_frozen():
+            if _stop_wanted(control, customer_id, job_id):
                 stop_reason = "stopped"
                 break
             batch = db.tgm_pending_recipients(customer_id, job_id, account_id,
@@ -621,7 +742,7 @@ async def _run_account(customer_id, job_id, account: dict, control: dict) -> Non
             if not batch:
                 break
             for row in batch:
-                if control["stop"] or db.are_sends_frozen():
+                if _stop_wanted(control, customer_id, job_id):
                     stop_reason = "stopped"
                     break
                 target = row.get("target") or {}
@@ -641,42 +762,84 @@ async def _run_account(customer_id, job_id, account: dict, control: dict) -> Non
                 # quietly counting them as delivered.
                 db.tgm_set_recipient(customer_id, job_id, row["idx"], "inflight")
                 try:
-                    await _deliver(client, target, content, delay, plan=plan)
+                    # A hard per-send timeout, as the reference does. Without it
+                    # one hung socket holds the session claim and the whole turn
+                    # for as long as the network cares to keep it open, and the
+                    # job looks dead while nothing is wrong with the other
+                    # accounts. config.TG_SEND_TIMEOUT is deliberately larger
+                    # than any legitimate FloodWait sleep inside safe_call, so
+                    # this can only fire on something genuinely stuck.
+                    await asyncio.wait_for(
+                        _deliver(client, target, content, delay, plan=plan),
+                        timeout=config.TG_SEND_TIMEOUT)
                     db.tgm_set_recipient(customer_id, job_id, row["idx"], "sent")
                     db.tgm_mark_uid_sent(customer_id, job_id, uid)
                     db.mark_sent(customer_id, account_id, uid, platform="tg")
                     sent += 1
-                    consecutive = 0
+                    if consecutive:
+                        # The counter is durable, so a success has to clear the
+                        # stored value too — otherwise a turn interrupted after a
+                        # few scattered failures would resume already half-way to
+                        # its ceiling.
+                        consecutive = 0
+                        db.tgm_update_account(customer_id, job_id, account_id,
+                                              consec_fail=0, last_error="")
                 except Exception as exc:  # noqa: BLE001
+                    # A locked database is OUR contention, not this account's
+                    # fault and not this recipient's. The reference pauses the job
+                    # and resumes from the durable checkpoint; ours used to spend
+                    # the account's error budget on it, or fail the whole job when
+                    # it was raised between recipients.
+                    if _is_transient_db_error(exc):
+                        try:
+                            db.tgm_set_recipient(customer_id, job_id,
+                                                 row["idx"], "pending",
+                                                 "db busy")
+                        except Exception:      # noqa: BLE001 - still locked
+                            pass
+                        # Pause the JOB, not just this account: the contention is
+                        # ours and the next account would hit the same wall.
+                        control["pause"] = True
+                        stop_reason = "db_busy"
+                        break
                     wait = _is_flood(exc)
                     if wait:
                         # Not a failure: Telegram is asking us to slow down.
                         # Counting this as an error is how healthy accounts used
                         # to get abandoned.
                         #
-                        # A SHORT wait is slept through here, because parking and
-                        # reopening the session costs more than the wait itself.
-                        # A LONG one must NOT be: this used to
-                        # `await asyncio.sleep(wait)` unconditionally, inside the
-                        # recipient loop, still holding the session claim. An
-                        # 11-hour FloodWait therefore froze the whole job — every
-                        # other account queued behind the throttled one and the
-                        # customer saw a send that had simply stopped. The
-                        # account is now PARKED and the job moves to the next
-                        # one; the runner picks it back up when the cooldown
-                        # expires and it continues from what is left.
-                        if wait <= FLOOD_INLINE_MAX:
+                        # PARK, do not sleep here. This used to
+                        # `await asyncio.sleep(wait)` inside the recipient loop
+                        # while still holding the session claim, so an 11-hour
+                        # FloodWait froze the whole job behind one account. Even
+                        # the later "short waits only" version had two faults the
+                        # reference does not: the sleep ignored the stop button,
+                        # and an inline wait never counted toward the give-up
+                        # ceiling — so an account could absorb short FloodWaits
+                        # forever and never be parked. Parking is now the default
+                        # (TG_FLOOD_INLINE_MAX=0) and any inline wait that is
+                        # configured is interruptible.
+                        if wait <= config.TG_FLOOD_INLINE_MAX:
                             db.tgm_update_account(
                                 customer_id, job_id, account_id,
                                 last_error=f"floodwait {wait}s (waiting)")
-                            await asyncio.sleep(wait)
+                            if not await _sleep_unless_stopped(control, wait):
+                                stop_reason = "stopped"
+                                break
                             continue
                         stop_reason = "floodwait"
                         flood_seconds = wait
                         break
                     if _is_fatal_account_error(exc):
                         stop_reason = "auth_failed"
-                        db.tg_set_status(customer_id, account_id, "dead")
+                        # Only a SESSION failure means the account is dead. A lost
+                        # connection abandons the turn but says nothing about the
+                        # account, and marking it "dead" for a network blip made
+                        # the customer re-login a perfectly good account.
+                        if not _is_connection_error(exc):
+                            db.tg_set_status(customer_id, account_id, "dead")
+                        else:
+                            stop_reason = "connection"
                         break
                     permanent = _is_permanent_recipient_error(exc)
                     db.tgm_set_recipient(
@@ -685,9 +848,19 @@ async def _run_account(customer_id, job_id, account: dict, control: dict) -> Non
                         type(exc).__name__)
                     if permanent:
                         skipped += 1
-                    else:
-                        failed += 1
-                        consecutive += 1
+                        continue
+                    failed += 1
+                    # ONLY a platform restriction counts toward the ceiling, as in
+                    # the reference. Every transient error used to count, so five
+                    # scattered hiccups across a thousand recipients stopped a
+                    # healthy account and told the customer it had been set aside
+                    # for its own protection.
+                    if not _is_restriction_error(exc):
+                        continue
+                    consecutive += 1
+                    db.tgm_update_account(customer_id, job_id, account_id,
+                                          consec_fail=consecutive,
+                                          last_error=type(exc).__name__)
                     if consecutive >= max_errors:
                         stop_reason = "error_burst"
                         break
@@ -727,8 +900,15 @@ async def _run_account(customer_id, job_id, account: dict, control: dict) -> Non
             db.tgm_update_account(customer_id, job_id, account_id,
                                  sent_count=sent, failed_count=failed,
                                  consec_fail=consecutive,
+                                 # 'connection' and 'db_busy' are recoverable, so
+                                 # they land on 'stopped' — which resume() puts
+                                 # back in the queue. Only a dead SESSION is
+                                 # 'failed', because that one cannot be retried
+                                 # without a fresh login.
                                  state={"auth_failed": "failed",
                                         "error_burst": "stopped",
+                                        "connection": "stopped",
+                                        "db_busy": "stopped",
                                         "stopped": "stopped"}.get(stop_reason,
                                                                   "done"),
                                  last_error=stop_reason)

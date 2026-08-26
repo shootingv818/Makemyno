@@ -151,12 +151,23 @@ def test_giving_up_skips_the_rest_and_marks_the_inflight_one_uncertain(alice, jo
     assert db.tgm_job_accounts(alice, job_id)[0]["state"] == "failed"
 
 
-def test_resume_requeues_inflight_rows(alice, job):
+def test_an_orphaned_inflight_row_is_quarantined_not_resent(alice, job):
+    """It was claimed before the send and rewritten after it.
+
+    So a process that died in between left no evidence either way, and requeueing
+    it — which is what this used to do — sends that person the advert a SECOND
+    time. Duplicate messages are what get an account reported, so the reference
+    marks these 'uncertain' and never retries them; the card counts uncertain
+    toward the total so the job still completes.
+    """
     job_id, _aid = job
     db.tgm_set_recipient(alice, job_id, 1, "inflight")
     assert db.tgm_reset_inflight(alice, job_id) == 1
-    assert db.tgm_counts(alice, job_id).get("pending") == 3, \
-        "an orphaned inflight row is never retried, so the job cannot finish"
+    counts = db.tgm_counts(alice, job_id)
+    assert counts.get("uncertain") == 1
+    assert counts.get("pending") == 2, "the claimed row must NOT go back in line"
+    assert int(db.tgm_get_job(alice, job_id)["uncertain_count"]) == 1, \
+        "the job counter must move too, or the card can never reach 100%"
 
 
 def test_resume_requeues_stopped_accounts_but_not_failed_ones(alice, job):

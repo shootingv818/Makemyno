@@ -399,6 +399,23 @@ SECRETARY_REPLY_DELAY = _float("SECRETARY_REPLY_DELAY", 2.0)
 # Telegram section
 # --------------------------------------------------------------------------- #
 TG_FLOOD_MAX_WAIT = _int("TG_FLOOD_MAX_WAIT", 300)
+
+# Per-send hard timeout, ported from the reference (which wraps every recipient
+# in asyncio.wait_for). A send that hangs must not freeze a whole turn.
+#
+# THE FLOOR MATTERS MORE THAN THE VALUE. telegram_client.safe_call legitimately
+# sleeps out a FloodWait of up to TG_FLOOD_MAX_WAIT seconds INSIDE one send, so a
+# timeout smaller than that would fire on a send that is behaving correctly — and
+# because a timeout is treated as a hard account failure, a throttled-but-healthy
+# account would be abandoned instead of parked. The reference has that exact trap
+# (120s timeout over a 300s flood sleep); we refuse to reproduce it.
+TG_SEND_TIMEOUT = max(_int("TG_SEND_TIMEOUT", 180), TG_FLOOD_MAX_WAIT + 60)
+
+# A FloodWait no longer than this is slept through in place instead of parking
+# the account. 0 = the REFERENCE behaviour: park on every FloodWait, so the wait
+# is always interruptible by a stop and always counts toward the give-up ceiling.
+# Set it above 0 only if session churn ever proves more expensive than the wait.
+TG_FLOOD_INLINE_MAX = _int("TG_FLOOD_INLINE_MAX", 0)
 TG_SEND_DELAY_MIN = _float("TG_SEND_DELAY_MIN", 0.2)
 TG_SEND_DELAY_MAX = _float("TG_SEND_DELAY_MAX", 1.0)
 TG_SEND_DELAY = _float("TG_SEND_DELAY", 0.2)

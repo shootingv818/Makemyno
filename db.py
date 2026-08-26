@@ -3119,18 +3119,36 @@ def tgm_requeue_stopped_accounts(customer_id, job_id) -> int:
 
 
 def tgm_reset_inflight(customer_id, job_id) -> int:
-    """Return every in-flight recipient to pending.
+    """Quarantine every ownerless in-flight recipient as 'uncertain'.
 
-    Called when a job is resumed after a restart: a row still marked inflight has
-    no owner, and leaving it there means that recipient is never attempted again.
+    A row still marked inflight belongs to a turn that was killed — a restart, a
+    crash, a forced cancel. THE SEND MAY ALREADY HAVE ARRIVED: the row was claimed
+    before the send and only rewritten after it, so a process that died in between
+    left no evidence either way.
+
+    This used to set them back to 'pending', which meant a resumed job sent to
+    those people AGAIN. Duplicate messages are exactly what gets an account
+    reported, so the reference marks them 'uncertain' instead and never retries
+    them, and the progress card counts 'uncertain' toward the total (so a job can
+    still reach 100%) while showing the number separately. Honest and safe beats
+    complete.
+
+    Only the FloodWait park still returns its in-flight row to pending, and that
+    one is correct: nothing was killed there, the same process chose to stop
+    before sending.
     """
     cid = _require_cid(customer_id)
     conn = _conn()
     cur = conn.execute(
-        "UPDATE tg_multi_recipients SET state = 'pending' "
+        "UPDATE tg_multi_recipients SET state = 'uncertain', "
+        "last_error = 'interrupted after claim — not retried' "
         "WHERE job_id = ? AND customer_id = ? AND state = 'inflight'",
         (str(job_id), cid))
     changed = int(cur.rowcount or 0)
+    if changed:
+        conn.execute(
+            "UPDATE tg_multi_jobs SET uncertain_count = uncertain_count + ? "
+            "WHERE job_id = ? AND customer_id = ?", (changed, str(job_id), cid))
     conn.commit()
     conn.close()
     return changed

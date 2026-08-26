@@ -123,10 +123,62 @@ def test_permanent_recipient_errors_skip_only_that_person(message):
 
 
 def test_a_transient_error_is_neither():
-    exc = TimeoutError("read timeout")
+    exc = RuntimeError("something momentary")
     assert multi._is_flood(exc) == 0
     assert multi._is_fatal_account_error(exc) is False
     assert multi._is_permanent_recipient_error(exc) is False
+    assert multi._is_restriction_error(exc) is False, \
+        "a nameless hiccup must not count toward the account's error ceiling"
+
+
+@pytest.mark.parametrize("exc", [
+    TimeoutError("read timeout"),
+    ConnectionResetError("peer reset"),
+    OSError("network is unreachable"),
+])
+def test_a_lost_connection_abandons_the_turn_at_once(exc):
+    """Ported from the reference: a dead connection is not a per-recipient error.
+
+    Ours needed five of them to reach the ceiling, spending an account's whole
+    error budget on a network outage that had nothing to do with the account.
+    """
+    assert multi._is_fatal_account_error(exc) is True
+    assert multi._is_restriction_error(exc) is False
+
+
+def test_a_lost_connection_does_not_mark_the_account_dead():
+    """It abandons the TURN, not the account: the session is still valid.
+
+    Telling a customer their account is broken because the worker's network
+    blipped sends them to re-login a healthy account — an SMS code spent, and the
+    session moved to whichever server happens to answer.
+    """
+    assert multi._is_connection_error(TimeoutError("x")) is True
+    assert multi._is_connection_error(
+        Exception("AUTH_KEY_UNREGISTERED")) is False
+
+
+def test_a_locked_database_is_nobodys_fault():
+    """The reference pauses the job for SQLite contention.
+
+    Ours had no such class: raised inside the send it burned the account's error
+    budget, and raised between recipients it failed the WHOLE job — for a lock
+    that clears itself in milliseconds.
+    """
+    import sqlite3
+    locked = sqlite3.OperationalError("database is locked")
+    assert multi._is_transient_db_error(locked) is True
+    assert multi._is_fatal_account_error(locked) is False
+    assert multi._is_restriction_error(locked) is False
+
+
+@pytest.mark.parametrize("message", [
+    "PeerFloodError: too many requests",
+    "PEER_FLOOD",
+    "Too many requests for this account",
+])
+def test_only_a_platform_restriction_counts_toward_the_ceiling(message):
+    assert multi._is_restriction_error(Exception(message)) is True
 
 
 # --------------------------------------------------------------------------- #
@@ -363,9 +415,16 @@ def test_a_privacy_error_skips_just_that_recipient(alice, monkeypatch):
     assert job["state"] == "done"
 
 
+class _PeerFloodError(Exception):
+    """Shaped like Telethon's: the NAME is what marks it as a restriction."""
+
+
 def test_consecutive_failures_stop_the_account(alice, monkeypatch):
+    # A RESTRICTION error, not a timeout. Only restrictions count toward the
+    # ceiling now (as in the reference), and a timeout abandons the turn on the
+    # first one — which is a different test, below.
     _fake_client_layer(monkeypatch, [], fail_on={1, 2, 3, 4, 5, 6},
-                       raise_exc=TimeoutError("flaky"))
+                       raise_exc=_PeerFloodError("too many requests"))
     db.set_setting(alice, "max_errors", 3)
 
     job_id = db.tgm_create_job(alice, [{"kind": "text", "text": "hi"}], 0.0)
@@ -382,6 +441,66 @@ def test_consecutive_failures_stop_the_account(alice, monkeypatch):
     assert job["state"] == "paused"          # work remains
     account = db.tgm_job_accounts(alice, job_id)[0]
     assert account["state"] == "stopped"
+    assert int(account["consec_fail"] or 0) == 3, \
+        "the counter is durable, so a resumed turn does not start over"
+
+
+def test_scattered_hiccups_do_not_stop_a_healthy_account(alice, monkeypatch):
+    """The behaviour change, stated as a test.
+
+    Five failures spread across a thousand recipients used to stop an account
+    that was working perfectly, because every transient error counted toward the
+    ceiling. In the reference only a platform RESTRICTION does.
+    """
+    # The failures must be BACK TO BACK, and more of them than the ceiling. With
+    # a success in between, the counter resets and the test would pass even
+    # against the old "every error counts" behaviour — proving nothing.
+    delivered = []
+    _fake_client_layer(monkeypatch, delivered, fail_on={2, 3, 4},
+                       raise_exc=RuntimeError("momentary hiccup"))
+    db.set_setting(alice, "max_errors", 2)
+
+    job_id = db.tgm_create_job(alice, [{"kind": "text", "text": "hi"}], 0.0)
+    aid = db.tg_add_account(alice, "09120000001")
+    db.tgm_add_account(alice, job_id, aid, "09120000001", 0)
+    db.tgm_add_recipients(alice, job_id, aid,
+                          [(str(i), {"kind": "user", "id": i}, False)
+                           for i in range(1, 6)])
+
+    asyncio.run(multi._run(alice, job_id))
+
+    assert delivered == [1, 5], \
+        "three back-to-back hiccups are not a restriction: keep going"
+    job = db.tgm_get_job(alice, job_id)
+    assert job["failed_count"] == 3
+    assert job["state"] == "done"
+    account = db.tgm_job_accounts(alice, job_id)[0]
+    assert account["state"] == "done"
+    assert int(account["consec_fail"] or 0) == 0, \
+        "a hiccup must not leave the account carrying a restriction count"
+
+
+def test_one_lost_connection_ends_the_turn_without_killing_the_account(
+        alice, monkeypatch):
+    delivered = []
+    _fake_client_layer(monkeypatch, delivered, fail_on={2},
+                       raise_exc=ConnectionResetError("peer reset"))
+
+    job_id = db.tgm_create_job(alice, [{"kind": "text", "text": "hi"}], 0.0)
+    aid = db.tg_add_account(alice, "09120000001")
+    db.tgm_add_account(alice, job_id, aid, "09120000001", 0)
+    db.tgm_add_recipients(alice, job_id, aid,
+                          [(str(i), {"kind": "user", "id": i}, False)
+                           for i in range(1, 4)])
+
+    asyncio.run(multi._run(alice, job_id))
+
+    assert delivered == [1], "the turn ends at the connection error"
+    account = db.tgm_job_accounts(alice, job_id)[0]
+    assert account["state"] == "stopped", \
+        "'stopped' is requeued by resume; 'failed' would need a fresh login"
+    assert db.tg_get_account(alice, aid)["status"] != "dead", \
+        "a network blip must not send the customer to re-login a healthy account"
 
 
 def test_a_frozen_service_halts_the_job(alice, monkeypatch):
