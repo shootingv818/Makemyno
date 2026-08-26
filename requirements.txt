@@ -1,0 +1,42 @@
+# Pinned deliberately. A worker is built from this file on a fresh server, and it
+# must end up on the SAME versions as the master: an auto-upgrade that changes a
+# method signature turns into a fleet-wide outage nobody asked for.
+
+# ---- platform clients ------------------------------------------------------ #
+# Every rubpy call in this project was verified against 7.3.5.
+rubpy==7.3.5
+telethon==1.36.0
+
+python-dotenv==1.0.1
+
+# ---- worker subsystem (master + worker) ------------------------------------ #
+# Encrypts stored SSH credentials, portable sessions and backups.
+cryptography==42.0.8
+# Master -> worker provisioning and the SSH tunnel.
+asyncssh==2.14.2
+
+# The HTTP client the master uses to talk to a worker, and the server the worker
+# runs. THIS WHOLE BLOCK IS PINNED AS A SET.
+#
+# httpx was missing from this file entirely while worker.py and worker_api.py both
+# imported it — so a freshly built worker had no HTTP client at all.
+#
+# And the versions are pinned together because an incompatible
+# fastapi/starlette/uvicorn/pydantic mix makes a worker start cleanly and then
+# fail EVERY request with "asgi2 ... 'NoneType' object is not callable" — a
+# failure that looks like our bug and is not. The base project learned this the
+# hard way; these are the versions it settled on.
+httpx==0.27.0
+fastapi==0.110.0
+starlette==0.36.3
+pydantic==2.6.4
+uvicorn==0.29.0
+
+# Timezone data, so Asia/Tehran timestamps work on a minimal or foreign server
+# that ships no zoneinfo database.
+tzdata>=2024.1
+
+# ---- PV photo archive -> PDF ----------------------------------------------- #
+# reportlab builds the PDF; Pillow normalises images before they are embedded.
+reportlab==4.2.0
+Pillow==10.3.0

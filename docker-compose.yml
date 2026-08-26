@@ -1,0 +1,35 @@
+# Two processes, two tokens, one image.
+#
+# Workers are NOT started from here: the owner panel provisions them on remote
+# servers over SSH + Docker. A worker service is intentionally absent so nobody
+# accidentally runs a worker on the master with the master's own .env.
+services:
+  owner:
+    build: .
+    image: makemyno
+    container_name: makemyno-owner
+    restart: always
+    env_file: .env
+    # The role is an ARGUMENT, not an environment variable.
+    #
+    # Compose happens to let `environment:` win over `env_file:`, but systemd does
+    # the opposite — and relying on that difference is what put the owner bot on
+    # both services in production, with one /start answering twice and the customer
+    # bot never starting at all. argv is immune to precedence rules in either.
+    command: ["python", "main.py", "owner"]
+    volumes:
+      - ./data:/app/data
+
+  customer:
+    build: .
+    image: makemyno
+    container_name: makemyno-customer
+    restart: always
+    env_file: .env
+    command: ["python", "main.py", "customer"]
+    volumes:
+      # The same data directory on purpose: both processes share customer.db
+      # (WAL + busy_timeout make concurrent access safe) and the sessions folder.
+      - ./data:/app/data
+    depends_on:
+      - owner
